@@ -88,7 +88,7 @@ Note: Ensure your compiler supports the C++26 standard and enable `-O3` optimiza
 **Build Wei-Toolchain:**
 
 ```bash
-g++ -std=c++26 -O3 -o wt wei.cpp
+g++ -std=c++26 -O3 -o wt src/wt.cpp
 ```
 
 **Run:**
