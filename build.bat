@@ -1,5 +1,5 @@
 @echo off
-rem Wei compiler build entry point. The real build logic lives in build.ps1.
+rem Build the Wei compiler (MTG) from src\main.cpp.
 setlocal
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0build.ps1" %*
+g++ -std=c++26 -O3 -o "%~dp0mtg.exe" "%~dp0src\main.cpp"
 exit /b %ERRORLEVEL%

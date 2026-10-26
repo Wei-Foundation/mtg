@@ -76,7 +76,7 @@ mtg build <文件.wei> [选项]
 | 选项 | 说明 |
 | --- | --- |
 | `-o <文件>` | 指定输出文件路径 |
-| `-std:<风格>` | 选择源码方言：`wei27` / `wei`（默认）、`zh` / `cn` / `chinese` / `中文`、`wenyan` / `classical` / `文言` |
+| `-std:<风格>` | 选择源码方言：`wei27` / `wei` / `default`（默认）、`zh` / `cn` / `chinese` / `中文`、`wenyan` / `classical` / `文言` / `文言文` |
 | `-emit-norm:<文件>` | 把方言改写后的 wei27 源码写入指定文件，便于排查问题 |
 | `-target <平台>` | 目标平台：`win64` 或 `linux64`，默认为当前平台 |
 | `-no-opt` | 关闭编译期优化 |
@@ -161,6 +161,34 @@ mtg build hello-wenyan.wei -std:wenyan -o hello-wenyan.exe
 
 该程序输出 `10`。
 
+### 文言扫雷
+
+仓库中的 `saolei.wenyan.wei` 是一个用文言方言编写的控制台扫雷：
+
+- 9×9 棋盘，10 颗雷
+- 首次揭开的格子必定安全，其周围 3×3 范围内不会布雷
+- 数字表示相邻雷数，空白区域自动展开
+- 支持插旗、胜负判定、重新开局与退出，旗子上限为 10
+
+编译并运行：
+
+```bash
+mtg build saolei.wenyan.wei -std:wenyan -o saolei.exe
+saolei.exe
+```
+
+仓库根目录也已附带编译好的 Windows x64 程序 `saolei.exe`。
+
+操作指令：
+
+```text
+1 揭开　2 插旗　4 新局　0 退出
+```
+
+程序每次只读取一个整数，因此动作、行、列请分三次输入，每个数字单独占一行。
+行、列范围均为 1..9。棋盘符号：`#` 未揭开，`.` 空白，`1`–`8` 相邻雷数，
+`F` 旗子；失败时 `*` 表示未插旗的雷，`X` 表示插错的旗。
+
 ---
 
 ## 从源码构建
@@ -173,6 +201,8 @@ mtg build hello-wenyan.wei -std:wenyan -o hello-wenyan.exe
 ```bat
 g++ -std=c++26 -O3 -o mtg.exe src\main.cpp
 ```
+
+也可以直接运行 `build.bat`，它会在仓库根目录生成 `mtg.exe`。
 
 **Linux：**
 
@@ -193,9 +223,11 @@ g++ -std=c++26 -O3 -o mtg src/main.cpp
 ## 项目结构
 
 ```text
-src/main.cpp   # 编译器实现：前端、优化与 x86-64 代码生成
-src/mine.wei   # 示例程序（8x8 扫雷模拟）
-Wei.png        # 项目 Logo
+src/main.cpp          # 编译器实现：前端、优化与 x86-64 代码生成
+saolei.wenyan.wei     # 文言扫雷示例源码
+saolei.exe            # 文言扫雷的 Windows x64 可执行文件
+build.bat             # Windows 下的一键构建脚本
+Wei.png               # 项目 Logo
 README.md
 ```
 
