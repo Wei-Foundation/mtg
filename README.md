@@ -228,6 +228,7 @@ saolei.wenyan.wei     # 文言扫雷示例源码
 saolei.exe            # 文言扫雷的 Windows x64 可执行文件
 build.bat             # Windows 下的一键构建脚本
 Wei.png               # 项目 Logo
+LICENSE               # GNU GPLv3 完整协议文本
 README.md
 ```
 
@@ -241,4 +242,6 @@ README.md
 
 ## 许可证
 
-Module Target Generator使用 [《GNU 通用公共许可证》（第三版）](https://www.gnu.org/licenses/) 许可证。
+Module Target Generator 采用 [GNU 通用公共许可证第三版（GPLv3）](LICENSE) 授权。
+完整协议文本见仓库根目录的 [`LICENSE`](LICENSE) 文件，取自
+[GNU 官方发布页](https://www.gnu.org/licenses/gpl-3.0.txt)。
