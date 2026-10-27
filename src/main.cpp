@@ -9792,7 +9792,9 @@ struct LoopOptimizer {
 			c_.u8(0x88);
 			c_.u8(0x08);
 		} else if (n.callee == "__command_line") {
-			emit_import_call(8);
+			/* GetCommandLineA：返回进程完整命令行（ANSI，含 argv[0]）。
+			   旧实现误接到 VirtualAlloc，导致 __command_line() 恒为 0。 */
+			emit_import_call(12);
 		} else if (n.callee == "__file_open") {
 			c_.u8(0x48);
 			c_.u8(0x8B);
@@ -13579,13 +13581,13 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 			return "win64";
 		}
 		size_t importSize() const override {
-			return 96;   /* 12 个 IAT 槽: printf/fopen/fread/fwrite/fclose/GetStdHandle/ReadFile/ExitProcess/VirtualAlloc/VirtualProtect/SetConsoleOutputCP/SetConsoleCP */
+			return 104;  /* 13 个 IAT 槽: printf/fopen/fread/fwrite/fclose/GetStdHandle/ReadFile/ExitProcess/VirtualAlloc/VirtualProtect/SetConsoleOutputCP/SetConsoleCP/GetCommandLineA */
 		}
 		size_t fmtOffset(int kind) const override {
 			return (kind == 3) ? 112 : (kind == 0) ? 96 : 104;
 		}
 		void emitDataPrologue(NativeGen& g) override {
-			for (int i = 0; i < 12; i++) g.c_.u64(0);
+			for (int i = 0; i < 13; i++) g.c_.u64(0);
 			g.printf_iat_off_ = 0;
 			g.gsh_iat_off_ = 40;
 			g.rf_iat_off_ = 48;
@@ -14025,6 +14027,7 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 				else if (p.kind == 9) off = 72;   /* VirtualProtect */
 				else if (p.kind == 10) off = 80;  /* SetConsoleOutputCP */
 				else if (p.kind == 11) off = 88;  /* SetConsoleCP */
+				else if (p.kind == 12) off = 96;  /* GetCommandLineA */
 				int32_t rip_disp = static_cast<int32_t>(g.pe_data_rel_ + off - (p.pos + 4));
 				g.c_.patch_u32(p.pos, static_cast<uint32_t>(rip_disp));
 			}
