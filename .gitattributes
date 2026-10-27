@@ -14,3 +14,7 @@
 *.exe binary
 *.o binary
 *.obj binary
+
+# 替换调可恶的 C++，换成我们伟大的 Wei 语言
+*.wei linguist-language=Wei
+*.wei linguist-detectable
