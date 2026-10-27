@@ -1,0 +1,23 @@
+# 构建产物
+/mtg
+/mtg.exe
+*.o
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.log
+build/
+dist/
+out/
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

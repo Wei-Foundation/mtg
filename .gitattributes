@@ -1,0 +1,16 @@
+# 统一文本文件的换行符，避免跨平台协作时产生无意义的差异。
+* text=auto eol=lf
+
+# Windows 批处理必须使用 CRLF。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制文件不做行尾转换。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.exe binary
+*.o binary
+*.obj binary
