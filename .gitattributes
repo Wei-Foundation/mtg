@@ -23,13 +23,6 @@
 *.so binary
 *.a binary
 
-# 4. 替换掉可恶的 C++，换成我们伟大的 Wei 语言！
-# 强行将 cpp 和 h 文件在统计时归属为 Wei 语言
-*.cpp linguist-language=Wei
-*.h linguist-language=Wei
+# 4. 维语言源码识别（只做后缀识别，不强制替换 C++）
 *.wei linguist-language=Wei
 *.wei linguist-detectable
-
-# 5. (可选备用) 如果以后你还是想隐藏底层的 C++，
-# 把下面这行的 # 删掉即可：
-# src/main.cpp linguist-vendored
