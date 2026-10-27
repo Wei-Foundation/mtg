@@ -1,0 +1,8 @@
+Wei:
+  type: programming
+  color: "#E60000" # 专属的“中国红/赛博大魔王红”
+  extensions:
+    - ".wei"
+  tm_scope: source.wei
+  ace_mode: text
+  language_id: 1024 # 维语专属编号，对应 1024 程序员节

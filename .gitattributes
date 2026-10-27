@@ -14,7 +14,12 @@
 *.exe binary
 *.o binary
 *.obj binary
+*.lib binary
+*.dll binary
+*.so binary
+*.a binary
 
-# 替换调可恶的 C++，换成我们伟大的 Wei 语言
+# 替换掉可恶的 C++，换成我们伟大的 Wei 语言
 *.wei linguist-language=Wei
 *.wei linguist-detectable
+*.wei -diff
