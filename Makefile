@@ -20,7 +20,7 @@ ERRNULL := 2>/dev/null
 RUN     := ./$(TARGET)
 endif
 
-.PHONY: all check clean
+.PHONY: all check bootstrap-check clean
 
 all: $(TARGET)
 
@@ -29,6 +29,10 @@ $(TARGET): $(SRC) Makefile
 
 check: $(TARGET)
 	$(RUN) --version
+
+# Windows only: run the 10 bootstrap subset acceptance programs with stage0.
+bootstrap-check: $(TARGET)
+	powershell -NoProfile -ExecutionPolicy Bypass -File tests/bootstrap/run.ps1
 
 clean:
 	-@$(RM) mtg $(ERRNULL)

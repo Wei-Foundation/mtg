@@ -1,0 +1,3276 @@
+// MTG bootstrap stage1 (subset: bootstrap-subset-v1)
+// Build with: mtg.exe build src/bootstrap.wei -o bootstrap.exe
+// This file must only use the frozen subset in src/BOOTSTRAP.md.
+
+create.mod Mem::alloc(int n).omni {
+    return __rt_alloc(n);
+}
+
+create.mod Mem::free(omni p) {
+    __rt_free(p);
+}
+
+create.mod Cast::text(omni x).char {
+    return x;
+}
+
+create.mod Cast::toPtr(omni x).omni {
+    return x;
+}
+
+create.mod Cast::num(omni x).int {
+    return x;
+}
+
+// Read/write a non-negative 64-bit little-endian value at addr + off.
+// stage0 has no pointer arithmetic or shifts, so both helpers use byte loops.
+create.mod Mem::load64(ptr.int addr, int off).int {
+    create.int v = 0;
+    create.int i = 7;
+    while (i >= 0) {
+        v = v * 256 + __byte_at(addr, off + i);
+        i = i - 1;
+    }
+    return v;
+}
+
+create.mod Mem::store64(ptr.int addr, int off, int value) {
+    create.int v = value;
+    create.int i = 0;
+    while (i < 8) {
+        __store_byte(addr, off + i, v % 256);
+        v = v / 256;
+        i = i + 1;
+    }
+}
+
+create.mod Ctx::get(ptr.int ctx, int off).int {
+    return Mem::load64(ctx, off);
+}
+
+create.mod Ctx::set(ptr.int ctx, int off, int value) {
+    Mem::store64(ctx, off, value);
+}
+
+create.mod Cmd::line().omni {
+    return __command_line();
+}
+
+create.mod Str::len(char s).int {
+    create.int i = 0;
+    while (__byte_at(s, i) != 0) {
+        i = i + 1;
+    }
+    return i;
+}
+
+create.mod Str::eq(char a, char b).int {
+    create.int i = 0;
+    create.int ca = 0;
+    create.int cb = 0;
+    while (1 == 1) {
+        ca = __byte_at(a, i);
+        cb = __byte_at(b, i);
+        if (ca != cb) {
+            return 0;
+        }
+        if (ca == 0) {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+create.mod Str::eqRest(char s, int off, char lit).int {
+    create.int i = 0;
+    create.int c = 0;
+    while (1 == 1) {
+        c = __byte_at(lit, i);
+        if (c == 0) {
+            if (__byte_at(s, off + i) == 0) {
+                return 1;
+            }
+            return 0;
+        }
+        if (__byte_at(s, off + i) != c) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+create.mod Str::starts(char s, char prefix).int {
+    create.int i = 0;
+    create.int c = 0;
+    while (1 == 1) {
+        c = __byte_at(prefix, i);
+        if (c == 0) {
+            return 1;
+        }
+        if (__byte_at(s, i) != c) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+create.mod Str::copyAt(char dst, char src, int off, int max).int {
+    create.int i = 0;
+    create.int c = 0;
+    if (max <= 0) {
+        return 0;
+    }
+    while (i < max - 1) {
+        c = __byte_at(src, off + i);
+        __store_byte(dst, i, c);
+        if (c == 0) {
+            return i;
+        }
+        i = i + 1;
+    }
+    __store_byte(dst, max - 1, 0);
+    return max - 1;
+}
+
+create.mod Str::copy(char dst, char src, int max).int {
+    return Str::copyAt(dst, src, 0, max);
+}
+
+create.mod Str::append(char dst, int used, int max, char src).int {
+    create.int i = 0;
+    create.int c = 0;
+    if (max <= 0) {
+        return 0;
+    }
+    if (used < 0) {
+        used = 0;
+    }
+    while (used + i < max - 1) {
+        c = __byte_at(src, i);
+        __store_byte(dst, used + i, c);
+        if (c == 0) {
+            return used + i;
+        }
+        i = i + 1;
+    }
+    __store_byte(dst, max - 1, 0);
+    return max - 1;
+}
+
+create.mod Cmd::argc().int {
+    create.ptr.int p = Cmd::line();
+    create.int i = 0;
+    create.int count = 0;
+    create.int inq = 0;
+    create.int inarg = 0;
+    create.int c = __byte_at(p, 0);
+    while (c != 0) {
+        if (inq == 1) {
+            if (c == 34) {
+                inq = 0;
+            }
+            inarg = 1;
+        } else {
+            if (c == 34) {
+                inq = 1;
+                inarg = 1;
+            } else {
+                if (c == 32 || c == 9) {
+                    if (inarg == 1) {
+                        count = count + 1;
+                        inarg = 0;
+                    }
+                } else {
+                    inarg = 1;
+                }
+            }
+        }
+        i = i + 1;
+        c = __byte_at(p, i);
+    }
+    if (inarg == 1) {
+        count = count + 1;
+    }
+    return count;
+}
+
+create.mod Cmd::arg(int index, char out, int max).int {
+    create.ptr.int p = Cmd::line();
+    create.int i = 0;
+    create.int arg = 0;
+    create.int n = 0;
+    create.int inq = 0;
+    create.int started = 0;
+    create.int c = __byte_at(p, 0);
+    if (max <= 0) {
+        return 0;
+    }
+    while (c != 0) {
+        if (inq == 1) {
+            if (c == 34) {
+                inq = 0;
+            } else {
+                if (arg == index && n < max - 1) {
+                    __store_byte(out, n, c);
+                    n = n + 1;
+                }
+            }
+        } else {
+            if (c == 34) {
+                inq = 1;
+                started = 1;
+            } else {
+                if (c == 32 || c == 9) {
+                    if (started == 1) {
+                        if (arg == index) {
+                            __store_byte(out, n, 0);
+                            return n;
+                        }
+                        arg = arg + 1;
+                        n = 0;
+                        started = 0;
+                    }
+                } else {
+                    started = 1;
+                    if (arg == index && n < max - 1) {
+                        __store_byte(out, n, c);
+                        n = n + 1;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+        c = __byte_at(p, i);
+    }
+    if (started == 1 && arg == index) {
+        __store_byte(out, n, 0);
+        return n;
+    }
+    __store_byte(out, 0, 0);
+    return 0;
+}
+
+create.mod Path::base(char path, char out, int max).int {
+    create.int n = Str::len(path);
+    create.int i = n - 1;
+    create.int start = 0;
+    create.int c = 0;
+    while (i >= 0) {
+        c = __byte_at(path, i);
+        if (c == 92 || c == 47) {
+            start = i + 1;
+            i = -1;
+        } else {
+            i = i - 1;
+        }
+    }
+    return Str::copyAt(out, path, start, max);
+}
+
+create.mod Path::outName(char src, char out, int max).int {
+    create.int n = Str::len(src);
+    create.int start = 0;
+    create.int i = n - 1;
+    create.int end = n;
+    create.int j = 0;
+    create.int c = 0;
+    if (max <= 0) {
+        return 0;
+    }
+    while (i >= 0) {
+        c = __byte_at(src, i);
+        if (c == 92 || c == 47) {
+            start = i + 1;
+            i = -1;
+        } else {
+            i = i - 1;
+        }
+    }
+    i = n - 1;
+    while (i >= start) {
+        if (__byte_at(src, i) == 46) {
+            end = i;
+            i = start - 1;
+        } else {
+            i = i - 1;
+        }
+    }
+    i = start;
+    while (i < end && j < max - 5) {
+        __store_byte(out, j, __byte_at(src, i));
+        i = i + 1;
+        j = j + 1;
+    }
+    __store_byte(out, j, 46);
+    j = j + 1;
+    __store_byte(out, j, 101);
+    j = j + 1;
+    __store_byte(out, j, 120);
+    j = j + 1;
+    __store_byte(out, j, 101);
+    j = j + 1;
+    __store_byte(out, j, 0);
+    return j;
+}
+
+// ── Lexer ───────────────────────────────────────────────────────────────────
+// Token kinds:
+//   0 EOF, 1 ERROR, 2 IDENT, 3 INT, 4 STRING
+//   10 create, 11 mod, 12 int, 13 char, 14 ptr, 15 omni,
+//   16 if, 17 else, 18 while, 19 return, 20 true, 21 false,
+//   22 do, 23 emit
+//   30 ::, 31 ., 32 {, 33 }, 34 (, 35 ), 36 [, 37 ], 38 ,, 39 ;
+//   40 =, 41 ==, 42 !=, 43 <, 44 >, 45 <=, 46 >=,
+//   47 +, 48 -, 49 *, 50 /, 51 %, 52 !, 53 &&, 54 ||
+//
+// Context layout (byte offsets):
+//   0 srcPtr, 8 srcLen, 16 pos, 24 line, 32 col
+//   40 errCode, 48 errLine, 56 errCol, 64 errMsg
+//   72 cur token (kind,start,len,value,aux,line,col)
+//   128 peek token (same 7 fields)
+//   184 codePtr, 192 codeCap, 200 codePos
+//   208 dataPtr, 216 dataCap, 224 dataPos
+//   232 funcPtr, 240 funcCount, 248 localPtr, 256 localCount
+//   264 scopeLevel, 272 tempTop, 280 frameSlots, 288 frameSubPos
+//   296 retType, 304 epiloguePos, 312 retPatchPtr, 320 retPatchCount
+//   328 dataFixPtr, 336 dataFixCount, 344 iatFixPtr, 352 iatFixCount
+//   360 entryCallPos, 368 mainFound
+//   376 tmpStart, 384 tmpLine, 392 tmpCol, 400 tmpLen,
+//   408 tmpValue, 416 tmpAux, 424 lexBase
+//   432 outPathPtr, 440 outBufPtr, 448 outCap
+//   456 panicDivPos, 464 panicOobPos, 472 panicHeapPos
+//   480 rtAllocPos, 488 rtFreePos, 496 rtReadPos, 504 rtWritePos
+//   512 exprType, 520 blockDepth, 528 mainPos
+//   536 panicDivMsg, 544 panicOobMsg, 552 panicHeapMsg
+//   1024 block stack (64 frames x 40 bytes):
+//        kind, savedLocalCount, jump1, jump2, loopStart
+
+create.mod Lex::isAlpha(int c).int {
+    if (c >= 65 && c <= 90) {
+        return 1;
+    }
+    if (c >= 97 && c <= 122) {
+        return 1;
+    }
+    if (c == 95) {
+        return 1;
+    }
+    return 0;
+}
+
+create.mod Lex::isDigit(int c).int {
+    if (c >= 48 && c <= 57) {
+        return 1;
+    }
+    return 0;
+}
+
+create.mod Lex::isIdent(int c).int {
+    if (Lex::isAlpha(c) == 1) {
+        return 1;
+    }
+    if (Lex::isDigit(c) == 1) {
+        return 1;
+    }
+    return 0;
+}
+
+create.mod Src::byte(ptr.int ctx, int off).int {
+    create.ptr.int base = Cast::toPtr(Ctx::get(ctx, 0));
+    return __byte_at(base, off);
+}
+
+create.mod Src::eq(ptr.int ctx, int start, int len, char lit).int {
+    create.int n = Str::len(lit);
+    create.int i = 0;
+    if (n != len) {
+        return 0;
+    }
+    while (i < len) {
+        if (Src::byte(ctx, start + i) != __byte_at(lit, i)) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+create.mod Lex::fail(ptr.int ctx, int code).int {
+    Ctx::set(ctx, 40, 1);
+    Ctx::set(ctx, 48, Ctx::get(ctx, 384));
+    Ctx::set(ctx, 56, Ctx::get(ctx, 392));
+    Ctx::set(ctx, 64, code);
+    create.int base = Ctx::get(ctx, 424);
+    Ctx::set(ctx, base, 1);
+    Ctx::set(ctx, base + 8, Ctx::get(ctx, 376));
+    Ctx::set(ctx, base + 16, 0);
+    Ctx::set(ctx, base + 24, 0);
+    Ctx::set(ctx, base + 32, 0);
+    Ctx::set(ctx, base + 40, Ctx::get(ctx, 384));
+    Ctx::set(ctx, base + 48, Ctx::get(ctx, 392));
+    return 1;
+}
+
+create.mod Lex::putTok(ptr.int ctx, int base, int kind).int {
+    Ctx::set(ctx, base, kind);
+    Ctx::set(ctx, base + 8, Ctx::get(ctx, 376));
+    Ctx::set(ctx, base + 16, Ctx::get(ctx, 400));
+    Ctx::set(ctx, base + 24, Ctx::get(ctx, 408));
+    Ctx::set(ctx, base + 32, Ctx::get(ctx, 416));
+    Ctx::set(ctx, base + 40, Ctx::get(ctx, 384));
+    Ctx::set(ctx, base + 48, Ctx::get(ctx, 392));
+    return kind;
+}
+
+create.mod Lex::copyTok(ptr.int ctx, int dst, int src) {
+    create.int i = 0;
+    while (i < 7) {
+        Ctx::set(ctx, dst + i * 8, Ctx::get(ctx, src + i * 8));
+        i = i + 1;
+    }
+}
+
+create.mod Lex::take(ptr.int ctx).int {
+    create.int p = Ctx::get(ctx, 16);
+    create.int c = Src::byte(ctx, p);
+    Ctx::set(ctx, 16, p + 1);
+    if (c == 13) {
+        if (Src::byte(ctx, p + 1) == 10) {
+            Ctx::set(ctx, 16, p + 2);
+        }
+        Ctx::set(ctx, 24, Ctx::get(ctx, 24) + 1);
+        Ctx::set(ctx, 32, 1);
+    } else {
+        if (c == 10) {
+            Ctx::set(ctx, 24, Ctx::get(ctx, 24) + 1);
+            Ctx::set(ctx, 32, 1);
+        } else {
+            Ctx::set(ctx, 32, Ctx::get(ctx, 32) + 1);
+        }
+    }
+    return c;
+}
+
+create.mod Lex::skip(ptr.int ctx) {
+    create.int c = 0;
+    create.int p = 0;
+    while (1 == 1) {
+        p = Ctx::get(ctx, 16);
+        c = Src::byte(ctx, p);
+        if (c == 32 || c == 9 || c == 13 || c == 10) {
+            Lex::take(ctx);
+        } else {
+            if (c == 47 && Src::byte(ctx, p + 1) == 47) {
+                Lex::take(ctx);
+                Lex::take(ctx);
+                c = Src::byte(ctx, Ctx::get(ctx, 16));
+                while (c != 0 && c != 10 && c != 13) {
+                    Lex::take(ctx);
+                    c = Src::byte(ctx, Ctx::get(ctx, 16));
+                }
+            } else {
+                return;
+            }
+        }
+    }
+}
+
+create.mod Lex::keyword(ptr.int ctx, int start, int len).int {
+    if (len == 2) {
+        if (Src::eq(ctx, start, 2, "do") == 1) {
+            return 22;
+        }
+        if (Src::eq(ctx, start, 2, "if") == 1) {
+            return 16;
+        }
+        return 2;
+    }
+    if (len == 3) {
+        if (Src::eq(ctx, start, 3, "mod") == 1) {
+            return 11;
+        }
+        if (Src::eq(ctx, start, 3, "int") == 1) {
+            return 12;
+        }
+        if (Src::eq(ctx, start, 3, "ptr") == 1) {
+            return 14;
+        }
+        return 2;
+    }
+    if (len == 4) {
+        if (Src::eq(ctx, start, 4, "char") == 1) {
+            return 13;
+        }
+        if (Src::eq(ctx, start, 4, "omni") == 1) {
+            return 15;
+        }
+        if (Src::eq(ctx, start, 4, "else") == 1) {
+            return 17;
+        }
+        if (Src::eq(ctx, start, 4, "true") == 1) {
+            return 20;
+        }
+        if (Src::eq(ctx, start, 4, "emit") == 1) {
+            return 23;
+        }
+        return 2;
+    }
+    if (len == 5) {
+        if (Src::eq(ctx, start, 5, "while") == 1) {
+            return 18;
+        }
+        if (Src::eq(ctx, start, 5, "false") == 1) {
+            return 21;
+        }
+        return 2;
+    }
+    if (len == 6) {
+        if (Src::eq(ctx, start, 6, "create") == 1) {
+            return 10;
+        }
+        if (Src::eq(ctx, start, 6, "return") == 1) {
+            return 19;
+        }
+        return 2;
+    }
+    return 2;
+}
+
+create.mod Lex::scanIdent(ptr.int ctx, int base).int {
+    create.int start = Ctx::get(ctx, 376);
+    create.int c = Src::byte(ctx, Ctx::get(ctx, 16));
+    while (Lex::isIdent(c) == 1) {
+        Lex::take(ctx);
+        c = Src::byte(ctx, Ctx::get(ctx, 16));
+    }
+    create.int len = Ctx::get(ctx, 16) - start;
+    if (len > 128) {
+        return Lex::fail(ctx, 4);
+    }
+    Ctx::set(ctx, 400, len);
+    Ctx::set(ctx, 408, 0);
+    Ctx::set(ctx, 416, 0);
+    return Lex::putTok(ctx, base, Lex::keyword(ctx, start, len));
+}
+
+create.mod Lex::scanInt(ptr.int ctx, int base).int {
+    create.int start = Ctx::get(ctx, 376);
+    create.int v = 0;
+    create.int d = 0;
+    create.int c = Src::byte(ctx, Ctx::get(ctx, 16));
+    while (Lex::isDigit(c) == 1) {
+        d = c - 48;
+        if (v > 922337203685477580) {
+            return Lex::fail(ctx, 3);
+        }
+        if (v == 922337203685477580 && d > 7) {
+            return Lex::fail(ctx, 3);
+        }
+        v = v * 10 + d;
+        Lex::take(ctx);
+        c = Src::byte(ctx, Ctx::get(ctx, 16));
+    }
+    Ctx::set(ctx, 400, Ctx::get(ctx, 16) - start);
+    Ctx::set(ctx, 408, v);
+    Ctx::set(ctx, 416, 0);
+    return Lex::putTok(ctx, base, 3);
+}
+
+create.mod Lex::putData(ptr.int ctx, int b).int {
+    create.int pos = Ctx::get(ctx, 224);
+    if (pos >= 524832) {
+        return 0;
+    }
+    create.ptr.int base = Cast::toPtr(Ctx::get(ctx, 208));
+    __store_byte(base, pos, b);
+    Ctx::set(ctx, 224, pos + 1);
+    return 1;
+}
+
+create.mod Lex::scanStr(ptr.int ctx, int base).int {
+    create.int start = Ctx::get(ctx, 376);
+    create.int dataStart = Ctx::get(ctx, 224);
+    create.int out = 0;
+    create.int c = 0;
+    create.int e = 0;
+    create.int ok = 1;
+    Lex::take(ctx);
+    while (1 == 1) {
+        c = Src::byte(ctx, Ctx::get(ctx, 16));
+        if (c == 0) {
+            return Lex::fail(ctx, 1);
+        }
+        if (c == 10 || c == 13) {
+            return Lex::fail(ctx, 1);
+        }
+        if (c == 34) {
+            Lex::take(ctx);
+            Lex::putData(ctx, 0);
+            Ctx::set(ctx, 400, out);
+            Ctx::set(ctx, 408, 0);
+            Ctx::set(ctx, 416, dataStart);
+            return Lex::putTok(ctx, base, 4);
+        }
+        if (out >= 65535) {
+            return Lex::fail(ctx, 5);
+        }
+        if (c == 92) {
+            Lex::take(ctx);
+            e = Src::byte(ctx, Ctx::get(ctx, 16));
+            if (e == 0) {
+                return Lex::fail(ctx, 1);
+            }
+            if (e == 110) {
+                ok = Lex::putData(ctx, 10);
+                out = out + 1;
+            } else {
+                if (e == 116) {
+                    ok = Lex::putData(ctx, 9);
+                    out = out + 1;
+                } else {
+                    if (e == 114) {
+                        ok = Lex::putData(ctx, 13);
+                        out = out + 1;
+                    } else {
+                        if (e == 92) {
+                            ok = Lex::putData(ctx, 92);
+                            out = out + 1;
+                        } else {
+                            if (e == 34) {
+                                ok = Lex::putData(ctx, 34);
+                                out = out + 1;
+                            } else {
+                                if (e == 48) {
+                                    ok = Lex::putData(ctx, 0);
+                                    out = out + 1;
+                                } else {
+                                    ok = Lex::putData(ctx, 92);
+                                    if (ok == 1) {
+                                        ok = Lex::putData(ctx, e);
+                                    }
+                                    out = out + 2;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (ok == 0) {
+                return Lex::fail(ctx, 5);
+            }
+            Lex::take(ctx);
+        } else {
+            ok = Lex::putData(ctx, c);
+            out = out + 1;
+            if (ok == 0) {
+                return Lex::fail(ctx, 5);
+            }
+            Lex::take(ctx);
+        }
+    }
+    return Lex::fail(ctx, 1);
+}
+
+create.mod Lex::scanPunct(ptr.int ctx, int base, int c).int {
+    create.int p = Ctx::get(ctx, 16);
+    create.int n = Src::byte(ctx, p + 1);
+    create.int k = 0;
+    create.int len = 1;
+    if (c == 58) {
+        if (n == 58) {
+            k = 30;
+            len = 2;
+        } else {
+            return Lex::fail(ctx, 6);
+        }
+    } else {
+        if (c == 46) {
+            k = 31;
+        } else {
+            if (c == 123) {
+                k = 32;
+            } else {
+                if (c == 125) {
+                    k = 33;
+                } else {
+                    if (c == 40) {
+                        k = 34;
+                    } else {
+                        if (c == 41) {
+                            k = 35;
+                        } else {
+                            if (c == 91) {
+                                k = 36;
+                            } else {
+                                if (c == 93) {
+                                    k = 37;
+                                } else {
+                                    if (c == 44) {
+                                        k = 38;
+                                    } else {
+                                        if (c == 59) {
+                                            k = 39;
+                                        } else {
+                                            if (c == 61) {
+                                                if (n == 61) {
+                                                    k = 41;
+                                                    len = 2;
+                                                } else {
+                                                    k = 40;
+                                                }
+                                            } else {
+                                                if (c == 33) {
+                                                    if (n == 61) {
+                                                        k = 42;
+                                                        len = 2;
+                                                    } else {
+                                                        k = 52;
+                                                    }
+                                                } else {
+                                                    if (c == 60) {
+                                                        if (n == 61) {
+                                                            k = 45;
+                                                            len = 2;
+                                                        } else {
+                                                            k = 43;
+                                                        }
+                                                    } else {
+                                                        if (c == 62) {
+                                                            if (n == 61) {
+                                                                k = 46;
+                                                                len = 2;
+                                                            } else {
+                                                                k = 44;
+                                                            }
+                                                        } else {
+                                                            if (c == 43) {
+                                                                k = 47;
+                                                            } else {
+                                                                if (c == 45) {
+                                                                    k = 48;
+                                                                } else {
+                                                                    if (c == 42) {
+                                                                        k = 49;
+                                                                    } else {
+                                                                        if (c == 47) {
+                                                                            k = 50;
+                                                                        } else {
+                                                                            if (c == 37) {
+                                                                                k = 51;
+                                                                            } else {
+                                                                                if (c == 38) {
+                                                                                    if (n == 38) {
+                                                                                        k = 53;
+                                                                                        len = 2;
+                                                                                    } else {
+                                                                                        return Lex::fail(ctx, 7);
+                                                                                    }
+                                                                                } else {
+                                                                                    if (c == 124) {
+                                                                                        if (n == 124) {
+                                                                                            k = 54;
+                                                                                            len = 2;
+                                                                                        } else {
+                                                                                            return Lex::fail(ctx, 8);
+                                                                                        }
+                                                                                    } else {
+                                                                                        return Lex::fail(ctx, 2);
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Lex::take(ctx);
+    if (len == 2) {
+        Lex::take(ctx);
+    }
+    Ctx::set(ctx, 400, len);
+    Ctx::set(ctx, 408, 0);
+    Ctx::set(ctx, 416, 0);
+    return Lex::putTok(ctx, base, k);
+}
+
+create.mod Lex::scanInto(ptr.int ctx, int base).int {
+    Ctx::set(ctx, 424, base);
+    Lex::skip(ctx);
+    Ctx::set(ctx, 376, Ctx::get(ctx, 16));
+    Ctx::set(ctx, 384, Ctx::get(ctx, 24));
+    Ctx::set(ctx, 392, Ctx::get(ctx, 32));
+    Ctx::set(ctx, 400, 0);
+    Ctx::set(ctx, 408, 0);
+    Ctx::set(ctx, 416, 0);
+    create.int c = Src::byte(ctx, Ctx::get(ctx, 16));
+    if (c == 0) {
+        return Lex::putTok(ctx, base, 0);
+    }
+    if (Lex::isAlpha(c) == 1) {
+        return Lex::scanIdent(ctx, base);
+    }
+    if (Lex::isDigit(c) == 1) {
+        return Lex::scanInt(ctx, base);
+    }
+    if (c == 34) {
+        return Lex::scanStr(ctx, base);
+    }
+    return Lex::scanPunct(ctx, base, c);
+}
+
+create.mod Lex::init(ptr.int ctx, ptr.int src, int len) {
+    Ctx::set(ctx, 0, Cast::num(src));
+    Ctx::set(ctx, 8, len);
+    Ctx::set(ctx, 16, 0);
+    Ctx::set(ctx, 24, 1);
+    Ctx::set(ctx, 32, 1);
+    Ctx::set(ctx, 40, 0);
+    Ctx::set(ctx, 64, 0);
+    if (len >= 3) {
+        if (Src::byte(ctx, 0) == 239 && Src::byte(ctx, 1) == 187 && Src::byte(ctx, 2) == 191) {
+            Ctx::set(ctx, 16, 3);
+        }
+    }
+    Lex::scanInto(ctx, 72);
+    if (Ctx::get(ctx, 72) == 1) {
+        Lex::copyTok(ctx, 128, 72);
+    } else {
+        Lex::scanInto(ctx, 128);
+    }
+}
+
+create.mod Lex::next(ptr.int ctx).int {
+    Lex::copyTok(ctx, 72, 128);
+    create.int k = Ctx::get(ctx, 128);
+    if (k != 0 && k != 1) {
+        Lex::scanInto(ctx, 128);
+    }
+    return Ctx::get(ctx, 72);
+}
+
+create.mod Data::putRaw(ptr.int data, int off, char s).int {
+    create.int i = 0;
+    create.int c = __byte_at(s, 0);
+    while (c != 0) {
+        __store_byte(data, off + i, c);
+        i = i + 1;
+        c = __byte_at(s, i);
+    }
+    __store_byte(data, off + i, 0);
+    return off + i + 1;
+}
+
+create.mod Data::init(ptr.int ctx, ptr.int data, int cap) {
+    Ctx::set(ctx, 208, Cast::num(data));
+    Ctx::set(ctx, 216, cap);
+    Ctx::set(ctx, 224, 544);
+    do.emit::"DBG d1";
+    __store_byte(data, 512, 37);
+    __store_byte(data, 513, 108);
+    __store_byte(data, 514, 108);
+    __store_byte(data, 515, 100);
+    __store_byte(data, 516, 10);
+    __store_byte(data, 517, 0);
+    __store_byte(data, 528, 37);
+    __store_byte(data, 529, 115);
+    __store_byte(data, 530, 10);
+    __store_byte(data, 531, 0);
+    do.emit::"DBG d2";
+    create.int p = 544;
+    Ctx::set(ctx, 536, p);
+    p = Data::putRaw(data, p, "runtime panic: division by zero");
+    do.emit::"DBG d3";
+    Ctx::set(ctx, 544, p);
+    p = Data::putRaw(data, p, "runtime panic: array index out of bounds");
+    do.emit::"DBG d4";
+    Ctx::set(ctx, 552, p);
+    p = Data::putRaw(data, p, "runtime panic: heap exhausted");
+    Ctx::set(ctx, 224, p);
+    do.emit::"DBG d5";
+}
+
+// ── Code buffer and fixups ──────────────────────────────────────────────────
+create.mod Code::init(ptr.int ctx, ptr.int buf, int cap) {
+    Ctx::set(ctx, 184, Cast::num(buf));
+    Ctx::set(ctx, 192, cap);
+    Ctx::set(ctx, 200, 0);
+    create.int i = 0;
+    while (i < 64) {
+        __store_byte(buf, i, 0);
+        i = i + 1;
+    }
+    Ctx::set(ctx, 200, 64);
+}
+
+create.mod Code::pos(ptr.int ctx).int {
+    return Ctx::get(ctx, 200);
+}
+
+create.mod Code::seek(ptr.int ctx, int pos) {
+    Ctx::set(ctx, 200, pos);
+}
+
+create.mod Code::u8(ptr.int ctx, int b) {
+    create.int pos = Ctx::get(ctx, 200);
+    create.ptr.int buf = Cast::toPtr(Ctx::get(ctx, 184));
+    __store_byte(buf, pos, b);
+    Ctx::set(ctx, 200, pos + 1);
+}
+
+create.mod Code::u16(ptr.int ctx, int v) {
+    Code::u8(ctx, v % 256);
+    Code::u8(ctx, (v / 256) % 256);
+}
+
+create.mod Code::u32(ptr.int ctx, int v) {
+    Code::u8(ctx, v % 256);
+    Code::u8(ctx, (v / 256) % 256);
+    Code::u8(ctx, (v / 65536) % 256);
+    Code::u8(ctx, (v / 16777216) % 256);
+}
+
+create.mod Code::u64(ptr.int ctx, int v) {
+    create.int x = v;
+    create.int i = 0;
+    while (i < 8) {
+        Code::u8(ctx, x % 256);
+        x = x / 256;
+        i = i + 1;
+    }
+}
+
+create.mod Code::u32s(ptr.int ctx, int v) {
+    create.int x = v;
+    if (x < 0) {
+        x = x + 4294967296;
+    }
+    Code::u32(ctx, x);
+}
+
+create.mod Code::patch8(ptr.int ctx, int pos, int v) {
+    create.ptr.int buf = Cast::toPtr(Ctx::get(ctx, 184));
+    __store_byte(buf, pos, v);
+}
+
+create.mod Code::patch32(ptr.int ctx, int pos, int v) {
+    create.ptr.int buf = Cast::toPtr(Ctx::get(ctx, 184));
+    __store_byte(buf, pos, v % 256);
+    __store_byte(buf, pos + 1, (v / 256) % 256);
+    __store_byte(buf, pos + 2, (v / 65536) % 256);
+    __store_byte(buf, pos + 3, (v / 16777216) % 256);
+}
+
+create.mod Code::patch32s(ptr.int ctx, int pos, int v) {
+    create.int x = v;
+    if (x < 0) {
+        x = x + 4294967296;
+    }
+    Code::patch32(ctx, pos, x);
+}
+
+create.mod Code::patchRel(ptr.int ctx, int dispPos, int target) {
+    Code::patch32s(ctx, dispPos, target - (dispPos + 4));
+}
+
+create.mod Fix::init(ptr.int ctx, ptr.int dataFix, ptr.int iatFix) {
+    Ctx::set(ctx, 328, Cast::num(dataFix));
+    Ctx::set(ctx, 336, 0);
+    Ctx::set(ctx, 344, Cast::num(iatFix));
+    Ctx::set(ctx, 352, 0);
+}
+
+create.mod Fix::addData(ptr.int ctx, int pos, int off) {
+    create.int n = Ctx::get(ctx, 336);
+    if (n < 65536) {
+        create.ptr.int base = Cast::toPtr(Ctx::get(ctx, 328));
+        Mem::store64(base, n * 16, pos);
+        Mem::store64(base, n * 16 + 8, off);
+        Ctx::set(ctx, 336, n + 1);
+    }
+}
+
+create.mod Fix::addIat(ptr.int ctx, int pos, int off) {
+    create.int n = Ctx::get(ctx, 352);
+    if (n < 65536) {
+        create.ptr.int base = Cast::toPtr(Ctx::get(ctx, 344));
+        Mem::store64(base, n * 16, pos);
+        Mem::store64(base, n * 16 + 8, off);
+        Ctx::set(ctx, 352, n + 1);
+    }
+}
+
+create.mod Code::jmp(ptr.int ctx).int {
+    Code::u8(ctx, 233);
+    create.int pos = Ctx::get(ctx, 200);
+    Code::u32(ctx, 0);
+    return pos;
+}
+
+create.mod Code::jcc(ptr.int ctx, int cc).int {
+    Code::u8(ctx, 15);
+    Code::u8(ctx, 128 + cc);
+    create.int pos = Ctx::get(ctx, 200);
+    Code::u32(ctx, 0);
+    return pos;
+}
+
+create.mod Code::call(ptr.int ctx).int {
+    Code::u8(ctx, 232);
+    create.int pos = Ctx::get(ctx, 200);
+    Code::u32(ctx, 0);
+    return pos;
+}
+
+create.mod Code::callIat(ptr.int ctx, int off).int {
+    Code::u8(ctx, 255);
+    Code::u8(ctx, 21);
+    create.int pos = Ctx::get(ctx, 200);
+    Code::u32(ctx, 0);
+    Fix::addIat(ctx, pos, off);
+    return pos;
+}
+
+create.mod Code::leaRip(ptr.int ctx, int reg).int {
+    if (reg >= 8) {
+        Code::u8(ctx, 76);
+    } else {
+        Code::u8(ctx, 72);
+    }
+    Code::u8(ctx, 141);
+    Code::u8(ctx, 5 + (reg % 8) * 8);
+    create.int pos = Ctx::get(ctx, 200);
+    Code::u32(ctx, 0);
+    return pos;
+}
+
+create.mod Code::movRipReg(ptr.int ctx, int reg).int {
+    if (reg >= 8) {
+        Code::u8(ctx, 76);
+    } else {
+        Code::u8(ctx, 72);
+    }
+    Code::u8(ctx, 139);
+    Code::u8(ctx, 5 + (reg % 8) * 8);
+    create.int pos = Ctx::get(ctx, 200);
+    Code::u32(ctx, 0);
+    return pos;
+}
+
+create.mod Code::movRegRip(ptr.int ctx, int reg).int {
+    if (reg >= 8) {
+        Code::u8(ctx, 76);
+    } else {
+        Code::u8(ctx, 72);
+    }
+    Code::u8(ctx, 137);
+    Code::u8(ctx, 5 + (reg % 8) * 8);
+    create.int pos = Ctx::get(ctx, 200);
+    Code::u32(ctx, 0);
+    return pos;
+}
+
+create.mod Code::movImm64(ptr.int ctx, int reg, int v) {
+    if (reg >= 8) {
+        Code::u8(ctx, 73);
+    } else {
+        Code::u8(ctx, 72);
+    }
+    Code::u8(ctx, 184 + (reg % 8));
+    Code::u64(ctx, v);
+}
+
+create.mod Code::movRegSlot(ptr.int ctx, int reg, int slot) {
+    if (reg >= 8) {
+        Code::u8(ctx, 76);
+    } else {
+        Code::u8(ctx, 72);
+    }
+    Code::u8(ctx, 139);
+    Code::u8(ctx, 133 + (reg % 8) * 8);
+    Code::u32s(ctx, 0 - (slot + 1) * 8);
+}
+
+create.mod Code::movSlotReg(ptr.int ctx, int slot, int reg) {
+    if (reg >= 8) {
+        Code::u8(ctx, 76);
+    } else {
+        Code::u8(ctx, 72);
+    }
+    Code::u8(ctx, 137);
+    Code::u8(ctx, 133 + (reg % 8) * 8);
+    Code::u32s(ctx, 0 - (slot + 1) * 8);
+}
+
+create.mod Code::movSlotImm(ptr.int ctx, int slot, int v) {
+    Code::u8(ctx, 72);
+    Code::u8(ctx, 199);
+    Code::u8(ctx, 133);
+    Code::u32s(ctx, 0 - (slot + 1) * 8);
+    Code::u32(ctx, v);
+}
+
+create.mod Code::leaSlot(ptr.int ctx, int reg, int slot) {
+    if (reg >= 8) {
+        Code::u8(ctx, 76);
+    } else {
+        Code::u8(ctx, 72);
+    }
+    Code::u8(ctx, 141);
+    Code::u8(ctx, 133 + (reg % 8) * 8);
+    Code::u32s(ctx, 0 - (slot + 1) * 8);
+}
+
+create.mod Code::leaSlotOff(ptr.int ctx, int reg, int slot, int extra) {
+    if (reg >= 8) {
+        Code::u8(ctx, 76);
+    } else {
+        Code::u8(ctx, 72);
+    }
+    Code::u8(ctx, 141);
+    Code::u8(ctx, 133 + (reg % 8) * 8);
+    Code::u32s(ctx, 0 - (slot + 1) * 8 - extra);
+}
+
+create.mod Code::movRegReg(ptr.int ctx, int dst, int src) {
+    create.int rex = 72;
+    if (src >= 8) {
+        rex = rex + 4;
+    }
+    if (dst >= 8) {
+        rex = rex + 1;
+    }
+    Code::u8(ctx, rex);
+    Code::u8(ctx, 137);
+    Code::u8(ctx, 192 + (src % 8) * 8 + (dst % 8));
+}
+
+create.mod Code::addRegReg(ptr.int ctx, int dst, int src) {
+    create.int rex = 72;
+    if (dst >= 8) {
+        rex = rex + 4;
+    }
+    if (src >= 8) {
+        rex = rex + 1;
+    }
+    Code::u8(ctx, rex);
+    Code::u8(ctx, 3);
+    Code::u8(ctx, 192 + (dst % 8) * 8 + (src % 8));
+}
+
+create.mod Code::subRegReg(ptr.int ctx, int dst, int src) {
+    create.int rex = 72;
+    if (dst >= 8) {
+        rex = rex + 4;
+    }
+    if (src >= 8) {
+        rex = rex + 1;
+    }
+    Code::u8(ctx, rex);
+    Code::u8(ctx, 43);
+    Code::u8(ctx, 192 + (dst % 8) * 8 + (src % 8));
+}
+
+create.mod Code::imulRegReg(ptr.int ctx, int dst, int src) {
+    create.int rex = 72;
+    if (dst >= 8) {
+        rex = rex + 4;
+    }
+    if (src >= 8) {
+        rex = rex + 1;
+    }
+    Code::u8(ctx, rex);
+    Code::u8(ctx, 15);
+    Code::u8(ctx, 175);
+    Code::u8(ctx, 192 + (dst % 8) * 8 + (src % 8));
+}
+
+create.mod Code::cmpRcxRax(ptr.int ctx) {
+    Code::u8(ctx, 72);
+    Code::u8(ctx, 57);
+    Code::u8(ctx, 193);
+}
+
+create.mod Code::testRax(ptr.int ctx) {
+    Code::u8(ctx, 72);
+    Code::u8(ctx, 133);
+    Code::u8(ctx, 192);
+}
+
+create.mod Code::xorEax(ptr.int ctx) {
+    Code::u8(ctx, 49);
+    Code::u8(ctx, 192);
+}
+
+create.mod Code::xorEcx(ptr.int ctx) {
+    Code::u8(ctx, 49);
+    Code::u8(ctx, 201);
+}
+
+create.mod Code::movEcxImm(ptr.int ctx, int v) {
+    Code::u8(ctx, 185);
+    Code::u32(ctx, v);
+}
+
+create.mod Code::idivRcx(ptr.int ctx) {
+    Code::u8(ctx, 72);
+    Code::u8(ctx, 153);
+    Code::u8(ctx, 72);
+    Code::u8(ctx, 247);
+    Code::u8(ctx, 249);
+}
+
+create.mod Code::negRax(ptr.int ctx) {
+    Code::u8(ctx, 72);
+    Code::u8(ctx, 247);
+    Code::u8(ctx, 216);
+}
+
+create.mod Code::setccAl(ptr.int ctx, int cc) {
+    Code::u8(ctx, 15);
+    Code::u8(ctx, 144 + cc);
+    Code::u8(ctx, 192);
+}
+
+create.mod Code::movzxEaxAl(ptr.int ctx) {
+    Code::u8(ctx, 15);
+    Code::u8(ctx, 182);
+    Code::u8(ctx, 192);
+}
+
+create.mod Code::shlRax3(ptr.int ctx) {
+    Code::u8(ctx, 72);
+    Code::u8(ctx, 193);
+    Code::u8(ctx, 224);
+    Code::u8(ctx, 3);
+}
+
+create.mod Code::andRaxF0(ptr.int ctx) {
+    Code::u8(ctx, 72);
+    Code::u8(ctx, 131);
+    Code::u8(ctx, 224);
+    Code::u8(ctx, 240);
+}
+
+create.mod Code::cmpRaxImm(ptr.int ctx, int v) {
+    Code::u8(ctx, 72);
+    Code::u8(ctx, 61);
+    Code::u32(ctx, v);
+}
+
+create.mod Code::pushRbp(ptr.int ctx) {
+    Code::u8(ctx, 85);
+}
+
+create.mod Code::popRbp(ptr.int ctx) {
+    Code::u8(ctx, 93);
+}
+
+create.mod Code::movRbpRsp(ptr.int ctx) {
+    Code::u8(ctx, 72);
+    Code::u8(ctx, 137);
+    Code::u8(ctx, 229);
+}
+
+create.mod Code::movRspRbp(ptr.int ctx) {
+    Code::u8(ctx, 72);
+    Code::u8(ctx, 137);
+    Code::u8(ctx, 236);
+}
+
+create.mod Code::subRspImm(ptr.int ctx, int v) {
+    Code::u8(ctx, 72);
+    Code::u8(ctx, 131);
+    Code::u8(ctx, 236);
+    Code::u8(ctx, v);
+}
+
+create.mod Code::subRspPlaceholder(ptr.int ctx).int {
+    Code::u8(ctx, 72);
+    Code::u8(ctx, 129);
+    Code::u8(ctx, 236);
+    create.int pos = Ctx::get(ctx, 200);
+    Code::u32(ctx, 0);
+    return pos;
+}
+
+create.mod Code::addRspImm(ptr.int ctx, int v) {
+    Code::u8(ctx, 72);
+    Code::u8(ctx, 129);
+    Code::u8(ctx, 196);
+    Code::u32(ctx, v);
+}
+
+create.mod Code::ret(ptr.int ctx) {
+    Code::u8(ctx, 195);
+}
+
+create.mod Code::int3(ptr.int ctx) {
+    Code::u8(ctx, 204);
+}
+
+create.mod Code::loadByte(ptr.int ctx) {
+    Code::u8(ctx, 15);
+    Code::u8(ctx, 182);
+    Code::u8(ctx, 4);
+    Code::u8(ctx, 17);
+}
+
+create.mod Code::storeByte(ptr.int ctx) {
+    Code::u8(ctx, 68);
+    Code::u8(ctx, 136);
+    Code::u8(ctx, 4);
+    Code::u8(ctx, 17);
+}
+
+create.mod Code::jmpTo(ptr.int ctx, int target) {
+    create.int p = Code::jmp(ctx);
+    Code::patchRel(ctx, p, target);
+}
+
+create.mod Code::jccTo(ptr.int ctx, int cc, int target) {
+    create.int p = Code::jcc(ctx, cc);
+    Code::patchRel(ctx, p, target);
+}
+
+create.mod Code::addRaxImm8(ptr.int ctx, int v) {
+    Code::u8(ctx, 72);
+    Code::u8(ctx, 131);
+    Code::u8(ctx, 192);
+    Code::u8(ctx, v);
+}
+
+create.mod Code::andRaxImm8(ptr.int ctx, int v) {
+    Code::u8(ctx, 72);
+    Code::u8(ctx, 131);
+    Code::u8(ctx, 224);
+    Code::u8(ctx, v);
+}
+
+create.mod Code::cmpRaxRcx(ptr.int ctx) {
+    Code::u8(ctx, 72);
+    Code::u8(ctx, 57);
+    Code::u8(ctx, 200);
+}
+
+create.mod Code::cmpRdxR8(ptr.int ctx) {
+    Code::u8(ctx, 76);
+    Code::u8(ctx, 57);
+    Code::u8(ctx, 194);
+}
+
+create.mod Code::loadElem(ptr.int ctx) {
+    // mov rax, [rcx + rax*8]
+    Code::u8(ctx, 72);
+    Code::u8(ctx, 139);
+    Code::u8(ctx, 4);
+    Code::u8(ctx, 193);
+}
+
+create.mod Code::storeElem(ptr.int ctx) {
+    // mov [rcx + rdx*8], rax
+    Code::u8(ctx, 72);
+    Code::u8(ctx, 137);
+    Code::u8(ctx, 4);
+    Code::u8(ctx, 209);
+}
+
+// ── Runtime stubs (emitted at the start of .text) ───────────────────────────
+create.mod Rt::panicStub(ptr.int ctx, int msgOff).int {
+    create.int pos = Code::pos(ctx);
+    create.int p = Code::leaRip(ctx, 1);
+    Fix::addData(ctx, p, 528);
+    p = Code::leaRip(ctx, 2);
+    Fix::addData(ctx, p, msgOff);
+    Code::xorEax(ctx);
+    Code::callIat(ctx, 0);
+    Code::movEcxImm(ctx, 1);
+    Code::callIat(ctx, 56);
+    Code::int3(ctx);
+    return pos;
+}
+
+create.mod Rt::alloc(ptr.int ctx) {
+    Code::u8(ctx, 72);
+    Code::u8(ctx, 133);
+    Code::u8(ctx, 201);
+    Code::jccTo(ctx, 14, Ctx::get(ctx, 472));
+    Code::movRegReg(ctx, 0, 1);
+    Code::addRaxImm8(ctx, 15);
+    Code::andRaxImm8(ctx, 240);
+    Code::movRegReg(ctx, 1, 0);
+    create.int p = Code::movRipReg(ctx, 0);
+    Fix::addData(ctx, p, 496);
+    Code::movRegReg(ctx, 2, 0);
+    Code::addRegReg(ctx, 2, 1);
+    p = Code::movRipReg(ctx, 8);
+    Fix::addData(ctx, p, 504);
+    Code::cmpRdxR8(ctx);
+    Code::jccTo(ctx, 7, Ctx::get(ctx, 472));
+    p = Code::movRegRip(ctx, 2);
+    Fix::addData(ctx, p, 496);
+    Code::ret(ctx);
+}
+
+create.mod Rt::free(ptr.int ctx) {
+    Code::ret(ctx);
+}
+
+create.mod Rt::readFile(ptr.int ctx) {
+    Code::pushRbp(ctx);
+    Code::movRbpRsp(ctx);
+    Code::subRspImm(ctx, 96);
+    Code::movSlotReg(ctx, 0, 1);
+    Code::movSlotReg(ctx, 1, 2);
+    Code::movSlotReg(ctx, 2, 8);
+    Code::movRegSlot(ctx, 1, 0);
+    create.int p = Code::leaRip(ctx, 2);
+    Fix::addData(ctx, p, 320);
+    Code::callIat(ctx, 8);
+    Code::testRax(ctx);
+    create.int jz0 = Code::jcc(ctx, 4);
+    Code::movSlotReg(ctx, 3, 0);
+    Code::movRegSlot(ctx, 1, 1);
+    Code::movImm64(ctx, 2, 1);
+    Code::movRegSlot(ctx, 8, 2);
+    Code::movRegSlot(ctx, 9, 3);
+    Code::callIat(ctx, 16);
+    Code::movSlotReg(ctx, 4, 0);
+    Code::movRegSlot(ctx, 1, 3);
+    Code::callIat(ctx, 32);
+    Code::movRegSlot(ctx, 0, 4);
+    Code::movRspRbp(ctx);
+    Code::popRbp(ctx);
+    Code::ret(ctx);
+    Code::patchRel(ctx, jz0, Code::pos(ctx));
+    Code::xorEax(ctx);
+    Code::movRspRbp(ctx);
+    Code::popRbp(ctx);
+    Code::ret(ctx);
+}
+
+create.mod Rt::writeFile(ptr.int ctx) {
+    Code::pushRbp(ctx);
+    Code::movRbpRsp(ctx);
+    Code::subRspImm(ctx, 96);
+    Code::movSlotReg(ctx, 0, 1);
+    Code::movSlotReg(ctx, 1, 2);
+    Code::movSlotReg(ctx, 2, 8);
+    Code::movRegSlot(ctx, 1, 0);
+    create.int p = Code::leaRip(ctx, 2);
+    Fix::addData(ctx, p, 323);
+    Code::callIat(ctx, 8);
+    Code::testRax(ctx);
+    create.int jz0 = Code::jcc(ctx, 4);
+    Code::movSlotReg(ctx, 3, 0);
+    Code::movRegSlot(ctx, 1, 1);
+    Code::movImm64(ctx, 2, 1);
+    Code::movRegSlot(ctx, 8, 2);
+    Code::movRegSlot(ctx, 9, 3);
+    Code::callIat(ctx, 24);
+    Code::movSlotReg(ctx, 4, 0);
+    Code::movRegSlot(ctx, 1, 3);
+    Code::callIat(ctx, 32);
+    Code::movRegSlot(ctx, 0, 4);
+    Code::movRspRbp(ctx);
+    Code::popRbp(ctx);
+    Code::ret(ctx);
+    Code::patchRel(ctx, jz0, Code::pos(ctx));
+    Code::xorEax(ctx);
+    Code::movRspRbp(ctx);
+    Code::popRbp(ctx);
+    Code::ret(ctx);
+}
+
+create.mod Rt::init(ptr.int ctx) {
+    Ctx::set(ctx, 456, Rt::panicStub(ctx, Ctx::get(ctx, 536)));
+    Ctx::set(ctx, 464, Rt::panicStub(ctx, Ctx::get(ctx, 544)));
+    Ctx::set(ctx, 472, Rt::panicStub(ctx, Ctx::get(ctx, 552)));
+    Ctx::set(ctx, 480, Code::pos(ctx));
+    Rt::alloc(ctx);
+    Ctx::set(ctx, 488, Code::pos(ctx));
+    Rt::free(ctx);
+    Ctx::set(ctx, 496, Code::pos(ctx));
+    Rt::readFile(ctx);
+    Ctx::set(ctx, 504, Code::pos(ctx));
+    Rt::writeFile(ctx);
+}
+
+// ── PE32+ writer ────────────────────────────────────────────────────────────
+create.mod Num::alignUp(int v, int a).int {
+    create.int r = v % a;
+    if (r == 0) {
+        return v;
+    }
+    return v + (a - r);
+}
+
+create.mod Pe::zero(ptr.int buf, int start, int stop) {
+    create.int i = start;
+    while (i < stop) {
+        __store_byte(buf, i, 0);
+        i = i + 1;
+    }
+}
+
+create.mod Pe::u16(ptr.int buf, int off, int v) {
+    __store_byte(buf, off, v % 256);
+    __store_byte(buf, off + 1, (v / 256) % 256);
+}
+
+create.mod Pe::u32(ptr.int buf, int off, int v) {
+    __store_byte(buf, off, v % 256);
+    __store_byte(buf, off + 1, (v / 256) % 256);
+    __store_byte(buf, off + 2, (v / 65536) % 256);
+    __store_byte(buf, off + 3, (v / 16777216) % 256);
+}
+
+create.mod Pe::u64(ptr.int buf, int off, int v) {
+    create.int x = v;
+    create.int i = 0;
+    while (i < 8) {
+        __store_byte(buf, off + i, x % 256);
+        x = x / 256;
+        i = i + 1;
+    }
+}
+
+create.mod Pe::putStr(ptr.int buf, int off, char s).int {
+    create.int i = 0;
+    create.int c = __byte_at(s, 0);
+    while (c != 0) {
+        __store_byte(buf, off + i, c);
+        i = i + 1;
+        c = __byte_at(s, i);
+    }
+    __store_byte(buf, off + i, 0);
+    return off + i + 1;
+}
+
+create.mod Pe::fillImports(ptr.int ctx, ptr.int data, int dataRva) {
+    Pe::zero(data, 0, 512);
+    Pe::putStr(data, 146, "printf");
+    Pe::putStr(data, 156, "fopen");
+    Pe::putStr(data, 164, "fread");
+    Pe::putStr(data, 172, "fwrite");
+    Pe::putStr(data, 182, "fclose");
+    Pe::putStr(data, 192, "GetCommandLineA");
+    Pe::putStr(data, 210, "ExitProcess");
+    Pe::putStr(data, 222, "msvcrt.dll");
+    Pe::putStr(data, 233, "kernel32.dll");
+    Pe::putStr(data, 320, "rb");
+    Pe::putStr(data, 323, "wb");
+    Pe::u64(data, 0, dataRva + 144);
+    Pe::u64(data, 8, dataRva + 154);
+    Pe::u64(data, 16, dataRva + 162);
+    Pe::u64(data, 24, dataRva + 170);
+    Pe::u64(data, 32, dataRva + 180);
+    Pe::u64(data, 40, 0);
+    Pe::u64(data, 48, dataRva + 190);
+    Pe::u64(data, 56, dataRva + 208);
+    Pe::u64(data, 64, 0);
+    Pe::u64(data, 72, dataRva + 144);
+    Pe::u64(data, 80, dataRva + 154);
+    Pe::u64(data, 88, dataRva + 162);
+    Pe::u64(data, 96, dataRva + 170);
+    Pe::u64(data, 104, dataRva + 180);
+    Pe::u64(data, 112, 0);
+    Pe::u64(data, 120, dataRva + 190);
+    Pe::u64(data, 128, dataRva + 208);
+    Pe::u64(data, 136, 0);
+    Pe::u32(data, 256, dataRva + 72);
+    Pe::u32(data, 260, 0);
+    Pe::u32(data, 264, 0);
+    Pe::u32(data, 268, dataRva + 222);
+    Pe::u32(data, 272, dataRva);
+    Pe::u32(data, 276, dataRva + 120);
+    Pe::u32(data, 280, 0);
+    Pe::u32(data, 284, 0);
+    Pe::u32(data, 288, dataRva + 233);
+    Pe::u32(data, 292, dataRva + 48);
+}
+
+create.mod Pe::patchFixes(ptr.int ctx, int dataRva) {
+    create.int n = Ctx::get(ctx, 336);
+    create.ptr.int base = Cast::toPtr(Ctx::get(ctx, 328));
+    create.int i = 0;
+    create.int pos = 0;
+    create.int off = 0;
+    while (i < n) {
+        pos = Mem::load64(base, i * 16);
+        off = Mem::load64(base, i * 16 + 8);
+        Code::patch32s(ctx, pos, dataRva + off - (4096 + pos + 4));
+        i = i + 1;
+    }
+    n = Ctx::get(ctx, 352);
+    base = Cast::toPtr(Ctx::get(ctx, 344));
+    i = 0;
+    while (i < n) {
+        pos = Mem::load64(base, i * 16);
+        off = Mem::load64(base, i * 16 + 8);
+        Code::patch32s(ctx, pos, dataRva + off - (4096 + pos + 4));
+        i = i + 1;
+    }
+}
+
+create.mod Pe::emitEntry(ptr.int ctx, int dataRva, int heapOff, int mainPos) {
+    create.int save = Ctx::get(ctx, 200);
+    Code::seek(ctx, 0);
+    Code::pushRbp(ctx);
+    Code::movRbpRsp(ctx);
+    Code::subRspImm(ctx, 32);
+    create.int p = Code::leaRip(ctx, 0);
+    Code::patch32s(ctx, p, dataRva + heapOff - (4096 + p + 4));
+    p = Code::movRegRip(ctx, 0);
+    Code::patch32s(ctx, p, dataRva + 496 - (4096 + p + 4));
+    p = Code::leaRip(ctx, 0);
+    Code::patch32s(ctx, p, dataRva + heapOff + 33554432 - (4096 + p + 4));
+    p = Code::movRegRip(ctx, 0);
+    Code::patch32s(ctx, p, dataRva + 504 - (4096 + p + 4));
+    p = Code::call(ctx);
+    Code::patch32s(ctx, p, mainPos - (p + 4));
+    Code::xorEcx(ctx);
+    Code::u8(ctx, 255);
+    Code::u8(ctx, 21);
+    p = Ctx::get(ctx, 200);
+    Code::u32(ctx, 0);
+    Code::patch32s(ctx, p, dataRva + 56 - (4096 + p + 4));
+    Code::int3(ctx);
+    Code::seek(ctx, save);
+}
+
+create.mod Pe::copyCode(ptr.int ctx, ptr.int out, int dstOff) {
+    create.int n = Ctx::get(ctx, 200);
+    create.ptr.int src = Cast::toPtr(Ctx::get(ctx, 184));
+    create.int i = 0;
+    while (i < n) {
+        __store_byte(out, dstOff + i, __byte_at(src, i));
+        i = i + 1;
+    }
+}
+
+create.mod Pe::copyData(ptr.int ctx, ptr.int out, int dstOff, int n) {
+    create.ptr.int src = Cast::toPtr(Ctx::get(ctx, 208));
+    create.int i = 0;
+    while (i < n) {
+        __store_byte(out, dstOff + i, __byte_at(src, i));
+        i = i + 1;
+    }
+}
+
+create.mod Pe::headers(ptr.int ctx, ptr.int out, int dataRva, int heapOff) {
+    create.int codeSize = Ctx::get(ctx, 200);
+    create.int textRaw = Num::alignUp(codeSize, 512);
+    create.int dataRaw = Num::alignUp(heapOff, 512);
+    create.int imageSize = Num::alignUp(dataRva + heapOff + 33554432, 4096);
+    Pe::u16(out, 0, 23117);
+    Pe::u32(out, 60, 64);
+    Pe::u32(out, 64, 17744);
+    Pe::u16(out, 68, 34404);
+    Pe::u16(out, 70, 2);
+    Pe::u32(out, 72, 0);
+    Pe::u32(out, 76, 0);
+    Pe::u32(out, 80, 0);
+    Pe::u16(out, 84, 240);
+    Pe::u16(out, 86, 34);
+    create.int opt = 88;
+    Pe::u16(out, opt, 523);
+    Pe::u32(out, opt + 4, textRaw);
+    Pe::u32(out, opt + 8, dataRaw);
+    Pe::u32(out, opt + 12, 0);
+    Pe::u32(out, opt + 16, 4096);
+    Pe::u32(out, opt + 20, 4096);
+    Pe::u64(out, opt + 24, 5368709120);
+    Pe::u32(out, opt + 32, 4096);
+    Pe::u32(out, opt + 36, 512);
+    Pe::u16(out, opt + 40, 6);
+    Pe::u16(out, opt + 42, 0);
+    Pe::u16(out, opt + 44, 0);
+    Pe::u16(out, opt + 46, 0);
+    Pe::u16(out, opt + 48, 6);
+    Pe::u16(out, opt + 50, 0);
+    Pe::u32(out, opt + 52, 0);
+    Pe::u32(out, opt + 56, imageSize);
+    Pe::u32(out, opt + 60, 512);
+    Pe::u32(out, opt + 64, 0);
+    Pe::u16(out, opt + 68, 3);
+    Pe::u16(out, opt + 70, 256);
+    Pe::u64(out, opt + 72, 16777216);
+    Pe::u64(out, opt + 80, 1048576);
+    Pe::u64(out, opt + 88, 1048576);
+    Pe::u64(out, opt + 96, 4096);
+    Pe::u32(out, opt + 104, 0);
+    Pe::u32(out, opt + 108, 16);
+    Pe::u32(out, opt + 120, dataRva + 256);
+    Pe::u32(out, opt + 124, 60);
+    Pe::u32(out, opt + 208, dataRva);
+    Pe::u32(out, opt + 212, 72);
+    create.int text = 328;
+    __store_byte(out, text, 46);
+    __store_byte(out, text + 1, 116);
+    __store_byte(out, text + 2, 101);
+    __store_byte(out, text + 3, 120);
+    __store_byte(out, text + 4, 116);
+    Pe::u32(out, text + 8, codeSize);
+    Pe::u32(out, text + 12, 4096);
+    Pe::u32(out, text + 16, textRaw);
+    Pe::u32(out, text + 20, 512);
+    Pe::u32(out, text + 36, 1610612768);
+    create.int data = 368;
+    __store_byte(out, data, 46);
+    __store_byte(out, data + 1, 100);
+    __store_byte(out, data + 2, 97);
+    __store_byte(out, data + 3, 116);
+    __store_byte(out, data + 4, 97);
+    Pe::u32(out, data + 8, heapOff + 33554432);
+    Pe::u32(out, data + 12, dataRva);
+    Pe::u32(out, data + 16, dataRaw);
+    Pe::u32(out, data + 20, 512 + textRaw);
+    Pe::u32(out, data + 36, 3221225536);
+}
+
+create.mod Pe::build(ptr.int ctx, ptr.int out, int cap, int mainPos).int {
+    do.emit::"DBG pe begin";
+    create.int codeSize = Ctx::get(ctx, 200);
+    do.emit::"DBG codeSize";
+    do.emit::codeSize;
+    create.int heapOff = Num::alignUp(Ctx::get(ctx, 224), 16);
+    do.emit::"DBG heapOff";
+    do.emit::heapOff;
+    create.int textRaw = Num::alignUp(codeSize, 512);
+    create.int dataRva = Num::alignUp(4096 + codeSize, 4096);
+    create.int dataRaw = Num::alignUp(heapOff, 512);
+    create.int total = 512 + textRaw + dataRaw;
+    do.emit::"DBG sizes";
+    do.emit::textRaw;
+    do.emit::dataRva;
+    do.emit::dataRaw;
+    do.emit::total;
+    if (total > cap) {
+        return 0;
+    }
+    create.ptr.int data = Cast::toPtr(Ctx::get(ctx, 208));
+    Pe::zero(out, 0, total);
+    Pe::fillImports(ctx, data, dataRva);
+    Pe::patchFixes(ctx, dataRva);
+    Pe::emitEntry(ctx, dataRva, heapOff, mainPos);
+    Pe::headers(ctx, out, dataRva, heapOff);
+    Pe::copyCode(ctx, out, 512);
+    Pe::copyData(ctx, out, 512 + textRaw, heapOff);
+    create.char path = Cast::text(Ctx::get(ctx, 432));
+    return __write_file(path, out, total);
+}
+
+create.mod Str::appendNum(char dst, int used, int max, int v).int {
+    create.int digs[24];
+    create.int n = 0;
+    create.int x = v;
+    create.int neg = 0;
+    if (x < 0) {
+        neg = 1;
+        x = 0 - x;
+    }
+    if (x == 0) {
+        digs[0] = 48;
+        n = 1;
+    }
+    while (x > 0) {
+        digs[n] = 48 + x % 10;
+        n = n + 1;
+        x = x / 10;
+    }
+    if (neg == 1) {
+        if (used < max - 1) {
+            __store_byte(dst, used, 45);
+            used = used + 1;
+        }
+    }
+    while (n > 0) {
+        n = n - 1;
+        if (used < max - 1) {
+            __store_byte(dst, used, digs[n]);
+            used = used + 1;
+        }
+    }
+    __store_byte(dst, used, 0);
+    return used;
+}
+
+create.mod Err::text(int code).char {
+    if (code == 1) { return "expected 'create'"; }
+    if (code == 2) { return "expected '.'"; }
+    if (code == 3) { return "expected 'mod'"; }
+    if (code == 4) { return "expected identifier"; }
+    if (code == 5) { return "expected '::'"; }
+    if (code == 6) { return "expected '('"; }
+    if (code == 7) { return "expected ')'"; }
+    if (code == 8) { return "expected '{'"; }
+    if (code == 9) { return "expected '}'"; }
+    if (code == 10) { return "expected ';'"; }
+    if (code == 11) { return "expected type"; }
+    if (code == 12) { return "expected expression"; }
+    if (code == 13) { return "unknown variable"; }
+    if (code == 14) { return "unknown function (must be defined before use)"; }
+    if (code == 15) { return "too many parameters"; }
+    if (code == 16) { return "too many arguments"; }
+    if (code == 17) { return "function table full"; }
+    if (code == 18) { return "local table full"; }
+    if (code == 19) { return "duplicate function"; }
+    if (code == 20) { return "duplicate local"; }
+    if (code == 21) { return "array length must be 1..65536"; }
+    if (code == 22) { return "too many frame slots"; }
+    if (code == 23) { return "array initializer too long"; }
+    if (code == 24) { return "expected '='"; }
+    if (code == 25) { return "invalid assignment target"; }
+    if (code == 26) { return "type mismatch"; }
+    if (code == 27) { return "unsupported builtin"; }
+    if (code == 28) { return "missing Main::main"; }
+    if (code == 29) { return "nesting too deep"; }
+    if (code == 30) { return "unsupported operator"; }
+    if (code == 31) { return "expected return type"; }
+    if (code == 32) { return "expected array subscript"; }
+    if (code == 33) { return "expected builtin call"; }
+    if (code == 36) { return "expected integer literal"; }
+    if (code == 37) { return "expression temp slots exhausted"; }
+    return "syntax error";
+}
+
+create.mod Err::lexText(int code).char {
+    if (code == 1) { return "unterminated string literal"; }
+    if (code == 2) { return "unknown character"; }
+    if (code == 3) { return "integer literal overflow"; }
+    if (code == 4) { return "identifier too long"; }
+    if (code == 5) { return "string literal too long"; }
+    if (code == 6) { return "stray ':'"; }
+    if (code == 7) { return "stray '&'"; }
+    if (code == 8) { return "stray '|'"; }
+    return "lexer error";
+}
+
+create.mod Err::report(ptr.int ctx, char file) {
+    create.ptr.int raw = Mem::alloc(2048);
+    create.char msg = Cast::text(raw);
+    create.int n = Str::append(msg, 0, 2048, file);
+    n = Str::append(msg, n, 2048, ":");
+    n = Str::appendNum(msg, n, 2048, Ctx::get(ctx, 48));
+    n = Str::append(msg, n, 2048, ":");
+    n = Str::appendNum(msg, n, 2048, Ctx::get(ctx, 56));
+    n = Str::append(msg, n, 2048, ": ");
+    if (Ctx::get(ctx, 40) == 1) {
+        n = Str::append(msg, n, 2048, Err::lexText(Ctx::get(ctx, 64)));
+    } else {
+        n = Str::append(msg, n, 2048, Err::text(Ctx::get(ctx, 64)));
+    }
+    do.emit::msg;
+    Mem::free(raw);
+}
+
+create.mod Msg::fileErr(char file, char text) {
+    create.ptr.int raw = Mem::alloc(2048);
+    create.char msg = Cast::text(raw);
+    create.int n = Str::append(msg, 0, 2048, file);
+    n = Str::append(msg, n, 2048, ":?:?: ");
+    Str::append(msg, n, 2048, text);
+    do.emit::msg;
+    Mem::free(raw);
+}
+
+create.mod Msg::done(char out) {
+    create.ptr.int raw = Mem::alloc(8192);
+    create.char msg = Cast::text(raw);
+    create.int n = Str::append(msg, 0, 8192, "[done] ");
+    n = Str::append(msg, n, 8192, out);
+    Str::append(msg, n, 8192, " (win64)");
+    do.emit::msg;
+    Mem::free(raw);
+}
+
+create.mod Parse::fail(ptr.int ctx, int code).int {
+    if (Ctx::get(ctx, 40) == 0) {
+        Ctx::set(ctx, 40, 2);
+        Ctx::set(ctx, 48, Ctx::get(ctx, 112));
+        Ctx::set(ctx, 56, Ctx::get(ctx, 120));
+        Ctx::set(ctx, 64, code);
+    }
+    return 0;
+}
+
+create.mod Parse::expect(ptr.int ctx, int kind, int code).int {
+    if (Ctx::get(ctx, 72) != kind) {
+        return Parse::fail(ctx, code);
+    }
+    Lex::next(ctx);
+    return 1;
+}
+
+create.mod Src::eqRange(ptr.int ctx, int a, int b, int len).int {
+    create.int i = 0;
+    while (i < len) {
+        if (Src::byte(ctx, a + i) != Src::byte(ctx, b + i)) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+create.mod Ident::eqCur(ptr.int ctx, char lit).int {
+    return Src::eq(ctx, Ctx::get(ctx, 80), Ctx::get(ctx, 88), lit);
+}
+
+create.mod Ident::eqTok(ptr.int ctx, int base, char lit).int {
+    return Src::eq(ctx, Ctx::get(ctx, base), Ctx::get(ctx, base + 8), lit);
+}
+
+create.mod Ident::saveTo(ptr.int ctx, int base) {
+    Ctx::set(ctx, base, Ctx::get(ctx, 80));
+    Ctx::set(ctx, base + 8, Ctx::get(ctx, 88));
+}
+
+create.mod Ty::compat(int a, int b).int {
+    if (a == b) {
+        return 1;
+    }
+    if (a == 3 || b == 3) {
+        return 1;
+    }
+    return 0;
+}
+
+// ── Function table (96-byte entries) ────────────────────────────────────────
+//   0 modOff, 8 modLen, 16 nameOff, 24 nameLen, 32 codePos,
+//   40 paramCount, 48..72 paramTypes, 80 retType, 88 defined
+create.mod Fn::get(ptr.int ctx, int i, int field).int {
+    create.ptr.int base = Cast::toPtr(Ctx::get(ctx, 232));
+    return Mem::load64(base, i * 96 + field);
+}
+
+create.mod Fn::set(ptr.int ctx, int i, int field, int value) {
+    create.ptr.int base = Cast::toPtr(Ctx::get(ctx, 232));
+    Mem::store64(base, i * 96 + field, value);
+}
+
+create.mod Fn::add(ptr.int ctx, int modOff, int nameOff, int codePos).int {
+    create.int n = Ctx::get(ctx, 240);
+    if (n >= 512) {
+        Parse::fail(ctx, 17);
+        return 0 - 1;
+    }
+    create.ptr.int base = Cast::toPtr(Ctx::get(ctx, 232));
+    Mem::store64(base, n * 96, modOff);
+    Mem::store64(base, n * 96 + 8, 0);
+    Mem::store64(base, n * 96 + 16, nameOff);
+    Mem::store64(base, n * 96 + 24, 0);
+    Mem::store64(base, n * 96 + 32, codePos);
+    Mem::store64(base, n * 96 + 40, 0);
+    Mem::store64(base, n * 96 + 48, 0);
+    Mem::store64(base, n * 96 + 56, 0);
+    Mem::store64(base, n * 96 + 64, 0);
+    Mem::store64(base, n * 96 + 72, 0);
+    Mem::store64(base, n * 96 + 80, 4);
+    Mem::store64(base, n * 96 + 88, 0);
+    Ctx::set(ctx, 240, n + 1);
+    return n;
+}
+
+create.mod Fn::findSaved(ptr.int ctx).int {
+    create.int n = Ctx::get(ctx, 240);
+    create.int i = 0;
+    while (i < n) {
+        if (Fn::get(ctx, i, 8) == Ctx::get(ctx, 568) && Fn::get(ctx, i, 24) == Ctx::get(ctx, 584)) {
+            if (Src::eqRange(ctx, Fn::get(ctx, i, 0), Ctx::get(ctx, 560), Ctx::get(ctx, 568)) == 1) {
+                if (Src::eqRange(ctx, Fn::get(ctx, i, 16), Ctx::get(ctx, 576), Ctx::get(ctx, 584)) == 1) {
+                    return i;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// ── Local table (48-byte entries) ───────────────────────────────────────────
+//   0 nameOff, 8 nameLen, 16 slot, 24 arrayLen, 32 type
+create.mod Loc::get(ptr.int ctx, int i, int field).int {
+    create.ptr.int base = Cast::toPtr(Ctx::get(ctx, 248));
+    return Mem::load64(base, i * 48 + field);
+}
+
+create.mod Loc::set(ptr.int ctx, int i, int field, int value) {
+    create.ptr.int base = Cast::toPtr(Ctx::get(ctx, 248));
+    Mem::store64(base, i * 48 + field, value);
+}
+
+create.mod Loc::findCur(ptr.int ctx).int {
+    create.int n = Ctx::get(ctx, 256);
+    create.int i = n - 1;
+    create.int len = Ctx::get(ctx, 88);
+    while (i >= 0) {
+        if (Loc::get(ctx, i, 8) == len) {
+            if (Src::eqRange(ctx, Loc::get(ctx, i, 0), Ctx::get(ctx, 80), len) == 1) {
+                return i;
+            }
+        }
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+create.mod Loc::findTok(ptr.int ctx, int base).int {
+    create.int n = Ctx::get(ctx, 256);
+    create.int i = n - 1;
+    create.int len = Ctx::get(ctx, base + 8);
+    while (i >= 0) {
+        if (Loc::get(ctx, i, 8) == len) {
+            if (Src::eqRange(ctx, Loc::get(ctx, i, 0), Ctx::get(ctx, base), len) == 1) {
+                return i;
+            }
+        }
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+create.mod Loc::addAt(ptr.int ctx, int ty, int arrLen, int nameBase).int {
+    create.int n = Ctx::get(ctx, 256);
+    if (n >= 1024) {
+        Parse::fail(ctx, 18);
+        return 0 - 1;
+    }
+    if (Loc::findTok(ctx, nameBase) >= 0) {
+        Parse::fail(ctx, 20);
+        return 0 - 1;
+    }
+    create.int width = 1;
+    if (arrLen > 0) {
+        width = arrLen;
+    }
+    if (Ctx::get(ctx, 280) + width > 131072) {
+        Parse::fail(ctx, 22);
+        return 0 - 1;
+    }
+    create.ptr.int base = Cast::toPtr(Ctx::get(ctx, 248));
+    Mem::store64(base, n * 48, Ctx::get(ctx, nameBase));
+    Mem::store64(base, n * 48 + 8, Ctx::get(ctx, nameBase + 8));
+    Mem::store64(base, n * 48 + 16, 68 + Ctx::get(ctx, 280));
+    Mem::store64(base, n * 48 + 24, arrLen);
+    Mem::store64(base, n * 48 + 32, ty);
+    Ctx::set(ctx, 280, Ctx::get(ctx, 280) + width);
+    Ctx::set(ctx, 256, n + 1);
+    return n;
+}
+
+create.mod Loc::addParamAt(ptr.int ctx, int ty, int index, int nameBase).int {
+    create.int n = Ctx::get(ctx, 256);
+    if (n >= 1024) {
+        Parse::fail(ctx, 18);
+        return 0 - 1;
+    }
+    if (Loc::findTok(ctx, nameBase) >= 0) {
+        Parse::fail(ctx, 20);
+        return 0 - 1;
+    }
+    create.ptr.int base = Cast::toPtr(Ctx::get(ctx, 248));
+    Mem::store64(base, n * 48, Ctx::get(ctx, nameBase));
+    Mem::store64(base, n * 48 + 8, Ctx::get(ctx, nameBase + 8));
+    Mem::store64(base, n * 48 + 16, 64 + index);
+    Mem::store64(base, n * 48 + 24, 0);
+    Mem::store64(base, n * 48 + 32, ty);
+    Ctx::set(ctx, 256, n + 1);
+    return n;
+}
+
+// ── Block stack (40-byte frames) ────────────────────────────────────────────
+//   0 kind, 8 savedLocalCount, 16 jump1, 24 jump2, 32 loopStart
+create.mod Blk::get(ptr.int ctx, int depth, int field).int {
+    return Ctx::get(ctx, 1024 + depth * 40 + field);
+}
+
+create.mod Blk::set(ptr.int ctx, int depth, int field, int value) {
+    Ctx::set(ctx, 1024 + depth * 40 + field, value);
+}
+
+create.mod Parse::push(ptr.int ctx, int kind, int jump1, int loopStart).int {
+    create.int depth = Ctx::get(ctx, 520);
+    if (depth >= 64) {
+        return Parse::fail(ctx, 29);
+    }
+    Blk::set(ctx, depth, 0, kind);
+    Blk::set(ctx, depth, 8, Ctx::get(ctx, 256));
+    Blk::set(ctx, depth, 16, jump1);
+    Blk::set(ctx, depth, 24, 0);
+    Blk::set(ctx, depth, 32, loopStart);
+    Ctx::set(ctx, 520, depth + 1);
+    return 1;
+}
+
+create.mod Parse::callEmit(ptr.int ctx, int argc, int base).int {
+    create.int idx = Fn::findSaved(ctx);
+    if (idx < 0) {
+        return Parse::fail(ctx, 14);
+    }
+    if (Fn::get(ctx, idx, 40) != argc) {
+        return Parse::fail(ctx, 16);
+    }
+    if (argc > 0) {
+        Code::movRegSlot(ctx, 1, base);
+    }
+    if (argc > 1) {
+        Code::movRegSlot(ctx, 2, base + 1);
+    }
+    if (argc > 2) {
+        Code::movRegSlot(ctx, 8, base + 2);
+    }
+    if (argc > 3) {
+        Code::movRegSlot(ctx, 9, base + 3);
+    }
+    create.int p = Code::call(ctx);
+    Code::patchRel(ctx, p, Fn::get(ctx, idx, 32));
+    Ctx::set(ctx, 512, Fn::get(ctx, idx, 80));
+    return 1;
+}
+
+create.mod Parse::builtinEmit(ptr.int ctx, int argc, int base).int {
+    if (Ident::eqTok(ctx, 560, "__command_line") == 1) {
+        if (argc != 0) {
+            return Parse::fail(ctx, 16);
+        }
+        Code::callIat(ctx, 48);
+        Ctx::set(ctx, 512, 3);
+        return 1;
+    }
+    if (Ident::eqTok(ctx, 560, "__exit") == 1) {
+        if (argc != 1) {
+            return Parse::fail(ctx, 16);
+        }
+        Code::movRegSlot(ctx, 1, base);
+        Code::callIat(ctx, 56);
+        Code::int3(ctx);
+        Ctx::set(ctx, 512, 4);
+        return 1;
+    }
+    if (Ident::eqTok(ctx, 560, "__byte_at") == 1) {
+        if (argc != 2) {
+            return Parse::fail(ctx, 16);
+        }
+        Code::movRegSlot(ctx, 1, base);
+        Code::movRegSlot(ctx, 2, base + 1);
+        Code::loadByte(ctx);
+        Ctx::set(ctx, 512, 0);
+        return 1;
+    }
+    if (Ident::eqTok(ctx, 560, "__store_byte") == 1) {
+        if (argc != 3) {
+            return Parse::fail(ctx, 16);
+        }
+        Code::movRegSlot(ctx, 1, base);
+        Code::movRegSlot(ctx, 2, base + 1);
+        Code::movRegSlot(ctx, 8, base + 2);
+        Code::storeByte(ctx);
+        Ctx::set(ctx, 512, 4);
+        return 1;
+    }
+    if (Ident::eqTok(ctx, 560, "__rt_alloc") == 1) {
+        if (argc != 1) {
+            return Parse::fail(ctx, 16);
+        }
+        Code::movRegSlot(ctx, 1, base);
+        create.int p = Code::call(ctx);
+        Code::patchRel(ctx, p, Ctx::get(ctx, 480));
+        Ctx::set(ctx, 512, 3);
+        return 1;
+    }
+    if (Ident::eqTok(ctx, 560, "__rt_free") == 1) {
+        if (argc != 1) {
+            return Parse::fail(ctx, 16);
+        }
+        Code::movRegSlot(ctx, 1, base);
+        create.int p = Code::call(ctx);
+        Code::patchRel(ctx, p, Ctx::get(ctx, 488));
+        Ctx::set(ctx, 512, 4);
+        return 1;
+    }
+    if (Ident::eqTok(ctx, 560, "__read_file") == 1) {
+        if (argc != 3) {
+            return Parse::fail(ctx, 16);
+        }
+        Code::movRegSlot(ctx, 1, base);
+        Code::movRegSlot(ctx, 2, base + 1);
+        Code::movRegSlot(ctx, 8, base + 2);
+        create.int p = Code::call(ctx);
+        Code::patchRel(ctx, p, Ctx::get(ctx, 496));
+        Ctx::set(ctx, 512, 0);
+        return 1;
+    }
+    if (Ident::eqTok(ctx, 560, "__write_file") == 1) {
+        if (argc != 3) {
+            return Parse::fail(ctx, 16);
+        }
+        Code::movRegSlot(ctx, 1, base);
+        Code::movRegSlot(ctx, 2, base + 1);
+        Code::movRegSlot(ctx, 8, base + 2);
+        create.int p = Code::call(ctx);
+        Code::patchRel(ctx, p, Ctx::get(ctx, 504));
+        Ctx::set(ctx, 512, 0);
+        return 1;
+    }
+    return Parse::fail(ctx, 27);
+}
+
+create.mod Code::testRcx(ptr.int ctx) {
+    Code::u8(ctx, 72);
+    Code::u8(ctx, 133);
+    Code::u8(ctx, 201);
+}
+
+create.mod Ident::isBuiltinTok(ptr.int ctx, int base).int {
+    if (Ident::eqTok(ctx, base, "__command_line") == 1) { return 1; }
+    if (Ident::eqTok(ctx, base, "__exit") == 1) { return 1; }
+    if (Ident::eqTok(ctx, base, "__byte_at") == 1) { return 1; }
+    if (Ident::eqTok(ctx, base, "__store_byte") == 1) { return 1; }
+    if (Ident::eqTok(ctx, base, "__rt_alloc") == 1) { return 1; }
+    if (Ident::eqTok(ctx, base, "__rt_free") == 1) { return 1; }
+    if (Ident::eqTok(ctx, base, "__read_file") == 1) { return 1; }
+    if (Ident::eqTok(ctx, base, "__write_file") == 1) { return 1; }
+    return 0;
+}
+
+create.mod Expr::prec(int k).int {
+    if (k == 54) { return 1; }
+    if (k == 53) { return 2; }
+    if (k == 41 || k == 42) { return 3; }
+    if (k >= 43 && k <= 46) { return 4; }
+    if (k == 47 || k == 48) { return 5; }
+    if (k == 49 || k == 50 || k == 51) { return 6; }
+    return 0;
+}
+
+create.mod Expr::parse(ptr.int ctx, int minPrec).int {
+    create.int k = Ctx::get(ctx, 72);
+    if (k == 48) {
+        Lex::next(ctx);
+        if (Expr::parse(ctx, 7) == 0) { return 0; }
+        Code::negRax(ctx);
+        Ctx::set(ctx, 512, 0);
+    } else {
+        if (k == 52) {
+            Lex::next(ctx);
+            if (Expr::parse(ctx, 7) == 0) { return 0; }
+            Code::testRax(ctx);
+            Code::setccAl(ctx, 4);
+            Code::movzxEaxAl(ctx);
+            Ctx::set(ctx, 512, 0);
+        } else {
+            if (k == 3) {
+                Code::movImm64(ctx, 0, Ctx::get(ctx, 96));
+                Ctx::set(ctx, 512, 0);
+                Lex::next(ctx);
+            } else {
+                if (k == 4) {
+                    create.int p = Code::leaRip(ctx, 0);
+                    Fix::addData(ctx, p, Ctx::get(ctx, 104));
+                    Ctx::set(ctx, 512, 1);
+                    Lex::next(ctx);
+                } else {
+                    if (k == 20) {
+                        Code::movImm64(ctx, 0, 1);
+                        Ctx::set(ctx, 512, 0);
+                        Lex::next(ctx);
+                    } else {
+                        if (k == 21) {
+                            Code::movImm64(ctx, 0, 0);
+                            Ctx::set(ctx, 512, 0);
+                            Lex::next(ctx);
+                        } else {
+                            if (k == 34) {
+                                Lex::next(ctx);
+                                if (Expr::parse(ctx, 1) == 0) { return 0; }
+                                if (Parse::expect(ctx, 35, 7) == 0) { return 0; }
+                            } else {
+                                if (k == 2) {
+                                    create.int idx = Loc::findCur(ctx);
+                                    if (idx >= 0) {
+                                        create.int slot = Loc::get(ctx, idx, 16);
+                                        create.int arrLen = Loc::get(ctx, idx, 24);
+                                        create.int ty = Loc::get(ctx, idx, 32);
+                                        if (arrLen > 0) {
+                                            Code::leaSlotOff(ctx, 0, slot, (arrLen - 1) * 8);
+                                            Ctx::set(ctx, 512, 2);
+                                        } else {
+                                            Code::movRegSlot(ctx, 0, slot);
+                                            Ctx::set(ctx, 512, ty);
+                                        }
+                                        Lex::next(ctx);
+                                        if (Ctx::get(ctx, 72) == 36) {
+                                            if (arrLen <= 0) { return Parse::fail(ctx, 32); }
+                                            Lex::next(ctx);
+                                            if (Expr::parse(ctx, 1) == 0) { return 0; }
+                                            if (Parse::expect(ctx, 37, 7) == 0) { return 0; }
+                                            Code::cmpRaxImm(ctx, arrLen);
+                                            Code::jccTo(ctx, 3, Ctx::get(ctx, 464));
+                                            Code::leaSlotOff(ctx, 1, slot, (arrLen - 1) * 8);
+                                            Code::loadElem(ctx);
+                                            Ctx::set(ctx, 512, 0);
+                                        }
+                                    } else {
+                                        create.int mode = 1;
+                                        Ident::saveTo(ctx, 560);
+                                        Lex::next(ctx);
+                                        if (Ctx::get(ctx, 72) == 30) {
+                                            Lex::next(ctx);
+                                            if (Ctx::get(ctx, 72) != 2) { return Parse::fail(ctx, 4); }
+                                            Ident::saveTo(ctx, 576);
+                                            Lex::next(ctx);
+                                        } else {
+                                            if (Ctx::get(ctx, 72) == 34 && Ident::isBuiltinTok(ctx, 560) == 1) {
+                                                mode = 2;
+                                            } else {
+                                                return Parse::fail(ctx, 13);
+                                            }
+                                        }
+                                        if (Ctx::get(ctx, 72) != 34) { return Parse::fail(ctx, 6); }
+                                        Lex::next(ctx);
+                                        create.int base = Ctx::get(ctx, 272);
+                                        create.int calleeModOff = Ctx::get(ctx, 560);
+                                        create.int calleeModLen = Ctx::get(ctx, 568);
+                                        create.int calleeMemOff = Ctx::get(ctx, 576);
+                                        create.int calleeMemLen = Ctx::get(ctx, 584);
+                                        create.int argc = 0;
+                                        create.int st = 1;
+                                        if (Ctx::get(ctx, 72) == 35) { st = 2; }
+                                        while (st == 1) {
+                                            if (argc >= 4) {
+                                                Parse::fail(ctx, 16);
+                                                st = 0;
+                                            } else {
+                                                Ctx::set(ctx, 272, base + argc + 1);
+                                                if (Expr::parse(ctx, 1) == 0) {
+                                                    st = 0;
+                                                } else {
+                                                    Code::movSlotReg(ctx, base + argc, 0);
+                                                    argc = argc + 1;
+                                                    if (Ctx::get(ctx, 72) == 38) {
+                                                        Lex::next(ctx);
+                                                    } else {
+                                                        st = 2;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if (st != 2) { return 0; }
+                                        if (Parse::expect(ctx, 35, 7) == 0) { return 0; }
+                                        Ctx::set(ctx, 272, base);
+                                        Ctx::set(ctx, 560, calleeModOff);
+                                        Ctx::set(ctx, 568, calleeModLen);
+                                        Ctx::set(ctx, 576, calleeMemOff);
+                                        Ctx::set(ctx, 584, calleeMemLen);
+                                        if (mode == 1) {
+                                            if (Parse::callEmit(ctx, argc, base) == 0) { return 0; }
+                                        } else {
+                                            if (Parse::builtinEmit(ctx, argc, base) == 0) { return 0; }
+                                        }
+                                    }
+                                } else {
+                                    return Parse::fail(ctx, 12);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    while (1 == 1) {
+        k = Ctx::get(ctx, 72);
+        create.int p = Expr::prec(k);
+        if (p == 0 || p < minPrec) { return 1; }
+        if (k == 53 || k == 54) {
+            Code::testRax(ctx);
+            create.int j1 = 0;
+            if (k == 53) {
+                j1 = Code::jcc(ctx, 4);
+            } else {
+                j1 = Code::jcc(ctx, 5);
+            }
+            Lex::next(ctx);
+            if (Expr::parse(ctx, p + 1) == 0) { return 0; }
+            Code::testRax(ctx);
+            Code::setccAl(ctx, 5);
+            Code::movzxEaxAl(ctx);
+            create.int j2 = Code::jmp(ctx);
+            Code::patchRel(ctx, j1, Code::pos(ctx));
+            if (k == 53) {
+                Code::xorEax(ctx);
+            } else {
+                Code::movImm64(ctx, 0, 1);
+            }
+            Code::patchRel(ctx, j2, Code::pos(ctx));
+            Ctx::set(ctx, 512, 0);
+        } else {
+            create.int slot = Ctx::get(ctx, 272);
+            if (slot >= 64) { return Parse::fail(ctx, 37); }
+            Code::movSlotReg(ctx, slot, 0);
+            Ctx::set(ctx, 272, slot + 1);
+            Lex::next(ctx);
+            if (Expr::parse(ctx, p + 1) == 0) { return 0; }
+            Ctx::set(ctx, 272, slot);
+            Code::movRegSlot(ctx, 1, slot);
+            if (k == 47) {
+                Code::addRegReg(ctx, 0, 1);
+                Ctx::set(ctx, 512, 0);
+            } else {
+                if (k == 48) {
+                    Code::subRegReg(ctx, 1, 0);
+                    Code::movRegReg(ctx, 0, 1);
+                    Ctx::set(ctx, 512, 0);
+                } else {
+                    if (k == 49) {
+                        Code::imulRegReg(ctx, 0, 1);
+                        Ctx::set(ctx, 512, 0);
+                    } else {
+                        if (k == 50 || k == 51) {
+                            Code::testRcx(ctx);
+                            Code::jccTo(ctx, 4, Ctx::get(ctx, 456));
+                            Code::movRegReg(ctx, 2, 0);
+                            Code::movRegReg(ctx, 0, 1);
+                            Code::movRegReg(ctx, 1, 2);
+                            Code::idivRcx(ctx);
+                            if (k == 51) {
+                                Code::movRegReg(ctx, 0, 2);
+                            }
+                            Ctx::set(ctx, 512, 0);
+                        } else {
+                            Code::cmpRcxRax(ctx);
+                            if (k == 41) { Code::setccAl(ctx, 4); }
+                            if (k == 42) { Code::setccAl(ctx, 5); }
+                            if (k == 43) { Code::setccAl(ctx, 12); }
+                            if (k == 44) { Code::setccAl(ctx, 15); }
+                            if (k == 45) { Code::setccAl(ctx, 14); }
+                            if (k == 46) { Code::setccAl(ctx, 13); }
+                            Code::movzxEaxAl(ctx);
+                            Ctx::set(ctx, 512, 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 1;
+}
+
+create.mod Parse::valueType(ptr.int ctx).int {
+    create.int k = Ctx::get(ctx, 72);
+    if (k == 12) {
+        Lex::next(ctx);
+        return 0;
+    }
+    if (k == 13) {
+        Lex::next(ctx);
+        return 1;
+    }
+    if (k == 15) {
+        Lex::next(ctx);
+        return 3;
+    }
+    if (k == 14) {
+        Lex::next(ctx);
+        if (Parse::expect(ctx, 31, 2) == 0) { return 0 - 1; }
+        if (Parse::expect(ctx, 12, 11) == 0) { return 0 - 1; }
+        return 2;
+    }
+    Parse::fail(ctx, 11);
+    return 0 - 1;
+}
+
+create.mod Parse::retType(ptr.int ctx).int {
+    create.int k = Ctx::get(ctx, 72);
+    if (k == 12) { Lex::next(ctx); return 0; }
+    if (k == 13) { Lex::next(ctx); return 1; }
+    if (k == 15) { Lex::next(ctx); return 3; }
+    Parse::fail(ctx, 31);
+    return 0 - 1;
+}
+
+create.mod Parse::var(ptr.int ctx).int {
+    Lex::next(ctx);
+    if (Parse::expect(ctx, 31, 2) == 0) { return 0; }
+    create.int ty = Parse::valueType(ctx);
+    if (ty < 0) { return 0; }
+    if (Ctx::get(ctx, 72) != 2) { return Parse::fail(ctx, 4); }
+    Ident::saveTo(ctx, 560);
+    Lex::next(ctx);
+    create.int arrLen = 0;
+    if (Ctx::get(ctx, 72) == 36) {
+        Lex::next(ctx);
+        if (Ctx::get(ctx, 72) != 3) { return Parse::fail(ctx, 36); }
+        arrLen = Ctx::get(ctx, 96);
+        Lex::next(ctx);
+        if (Parse::expect(ctx, 37, 7) == 0) { return 0; }
+        if (arrLen <= 0 || arrLen > 65536) { return Parse::fail(ctx, 21); }
+    }
+    create.int idx = Loc::addAt(ctx, ty, arrLen, 560);
+    if (idx < 0) { return 0; }
+    create.int slot = Loc::get(ctx, idx, 16);
+    create.int width = 1;
+    if (arrLen > 0) { width = arrLen; }
+    create.int j = 0;
+    while (j < width) {
+        Code::movSlotImm(ctx, slot + j, 0);
+        j = j + 1;
+    }
+    if (Ctx::get(ctx, 72) == 40) {
+        Lex::next(ctx);
+        if (arrLen > 0) {
+            if (Ctx::get(ctx, 72) != 32) { return Parse::fail(ctx, 8); }
+            Lex::next(ctx);
+            create.int e = 0;
+            create.int more = 1;
+            if (Ctx::get(ctx, 72) == 33) { more = 0; }
+            while (more == 1) {
+                if (e >= arrLen) { return Parse::fail(ctx, 23); }
+                if (Expr::parse(ctx, 1) == 0) { return 0; }
+                if (Ctx::get(ctx, 512) != 0) { return Parse::fail(ctx, 26); }
+                Code::movSlotReg(ctx, slot + arrLen - 1 - e, 0);
+                e = e + 1;
+                if (Ctx::get(ctx, 72) == 38) {
+                    Lex::next(ctx);
+                } else {
+                    more = 0;
+                }
+            }
+            if (Parse::expect(ctx, 33, 9) == 0) { return 0; }
+        } else {
+            if (Expr::parse(ctx, 1) == 0) { return 0; }
+            if (Ty::compat(ty, Ctx::get(ctx, 512)) == 0) { return Parse::fail(ctx, 26); }
+            Code::movSlotReg(ctx, slot, 0);
+        }
+    }
+    return Parse::expect(ctx, 39, 10);
+}
+
+create.mod Parse::emitStmt(ptr.int ctx).int {
+    Lex::next(ctx);
+    if (Parse::expect(ctx, 31, 2) == 0) { return 0; }
+    if (Parse::expect(ctx, 23, 3) == 0) { return 0; }
+    while (1 == 1) {
+        if (Parse::expect(ctx, 30, 5) == 0) { return 0; }
+        if (Expr::parse(ctx, 1) == 0) { return 0; }
+        Code::movRegReg(ctx, 2, 0);
+        create.int fmt = 512;
+        if (Ctx::get(ctx, 512) == 1) { fmt = 528; }
+        create.int p = Code::leaRip(ctx, 1);
+        Fix::addData(ctx, p, fmt);
+        Code::xorEax(ctx);
+        Code::callIat(ctx, 0);
+        if (Ctx::get(ctx, 72) != 30) {
+            return Parse::expect(ctx, 39, 10);
+        }
+    }
+    return 1;
+}
+
+create.mod Parse::ret(ptr.int ctx).int {
+    Lex::next(ctx);
+    create.int rt = Ctx::get(ctx, 296);
+    if (Ctx::get(ctx, 72) == 39) {
+        Lex::next(ctx);
+        Code::xorEax(ctx);
+    } else {
+        if (Expr::parse(ctx, 1) == 0) { return 0; }
+        if (rt == 4) { return Parse::fail(ctx, 26); }
+        if (Ty::compat(rt, Ctx::get(ctx, 512)) == 0) { return Parse::fail(ctx, 26); }
+        if (Parse::expect(ctx, 39, 10) == 0) { return 0; }
+    }
+    Code::movRspRbp(ctx);
+    Code::popRbp(ctx);
+    Code::ret(ctx);
+    return 1;
+}
+
+create.mod Parse::ifStmt(ptr.int ctx).int {
+    Lex::next(ctx);
+    if (Parse::expect(ctx, 34, 6) == 0) { return 0; }
+    if (Expr::parse(ctx, 1) == 0) { return 0; }
+    if (Parse::expect(ctx, 35, 7) == 0) { return 0; }
+    Code::testRax(ctx);
+    create.int j = Code::jcc(ctx, 4);
+    if (Parse::expect(ctx, 32, 8) == 0) { return 0; }
+    return Parse::push(ctx, 1, j, 0);
+}
+
+create.mod Parse::whileStmt(ptr.int ctx).int {
+    Lex::next(ctx);
+    if (Parse::expect(ctx, 34, 6) == 0) { return 0; }
+    create.int start = Code::pos(ctx);
+    if (Expr::parse(ctx, 1) == 0) { return 0; }
+    if (Parse::expect(ctx, 35, 7) == 0) { return 0; }
+    Code::testRax(ctx);
+    create.int j = Code::jcc(ctx, 4);
+    if (Parse::expect(ctx, 32, 8) == 0) { return 0; }
+    return Parse::push(ctx, 3, j, start);
+}
+
+create.mod Parse::identStmt(ptr.int ctx).int {
+    create.int idx = Loc::findCur(ctx);
+    Ident::saveTo(ctx, 560);
+    Lex::next(ctx);
+    if (idx >= 0) {
+        create.int slot = Loc::get(ctx, idx, 16);
+        create.int arrLen = Loc::get(ctx, idx, 24);
+        create.int ty = Loc::get(ctx, idx, 32);
+        if (Ctx::get(ctx, 72) == 40) {
+            if (arrLen > 0) { return Parse::fail(ctx, 25); }
+            Lex::next(ctx);
+            if (Expr::parse(ctx, 1) == 0) { return 0; }
+            if (Ty::compat(ty, Ctx::get(ctx, 512)) == 0) { return Parse::fail(ctx, 26); }
+            Code::movSlotReg(ctx, slot, 0);
+            return Parse::expect(ctx, 39, 10);
+        }
+        if (Ctx::get(ctx, 72) == 36) {
+            if (arrLen <= 0) { return Parse::fail(ctx, 25); }
+            Lex::next(ctx);
+            if (Expr::parse(ctx, 1) == 0) { return 0; }
+            if (Parse::expect(ctx, 37, 7) == 0) { return 0; }
+            Code::cmpRaxImm(ctx, arrLen);
+            Code::jccTo(ctx, 3, Ctx::get(ctx, 464));
+            create.int islot = Ctx::get(ctx, 272);
+            if (islot >= 64) { return Parse::fail(ctx, 37); }
+            Code::movSlotReg(ctx, islot, 0);
+            Ctx::set(ctx, 272, islot + 1);
+            if (Parse::expect(ctx, 40, 24) == 0) { return 0; }
+            if (Expr::parse(ctx, 1) == 0) { return 0; }
+            Ctx::set(ctx, 272, islot);
+            if (Ctx::get(ctx, 512) != 0) { return Parse::fail(ctx, 26); }
+            Code::leaSlotOff(ctx, 1, slot, (arrLen - 1) * 8);
+            Code::movRegSlot(ctx, 2, islot);
+            Code::storeElem(ctx);
+            return Parse::expect(ctx, 39, 10);
+        }
+        return Parse::fail(ctx, 25);
+    }
+    create.int mode = 1;
+    if (Ctx::get(ctx, 72) == 30) {
+        Lex::next(ctx);
+        if (Ctx::get(ctx, 72) != 2) { return Parse::fail(ctx, 4); }
+        Ident::saveTo(ctx, 576);
+        Lex::next(ctx);
+    } else {
+        if (Ctx::get(ctx, 72) == 34 && Ident::isBuiltinTok(ctx, 560) == 1) {
+            mode = 2;
+        } else {
+            return Parse::fail(ctx, 13);
+        }
+    }
+    if (Ctx::get(ctx, 72) != 34) { return Parse::fail(ctx, 6); }
+    Lex::next(ctx);
+    create.int base = Ctx::get(ctx, 272);
+    create.int calleeModOff = Ctx::get(ctx, 560);
+    create.int calleeModLen = Ctx::get(ctx, 568);
+    create.int calleeMemOff = Ctx::get(ctx, 576);
+    create.int calleeMemLen = Ctx::get(ctx, 584);
+    create.int argc = 0;
+    create.int st = 1;
+    if (Ctx::get(ctx, 72) == 35) { st = 2; }
+    while (st == 1) {
+        if (argc >= 4) {
+            Parse::fail(ctx, 16);
+            st = 0;
+        } else {
+            Ctx::set(ctx, 272, base + argc + 1);
+            if (Expr::parse(ctx, 1) == 0) {
+                st = 0;
+            } else {
+                Code::movSlotReg(ctx, base + argc, 0);
+                argc = argc + 1;
+                if (Ctx::get(ctx, 72) == 38) {
+                    Lex::next(ctx);
+                } else {
+                    st = 2;
+                }
+            }
+        }
+    }
+    if (st != 2) { return 0; }
+    if (Parse::expect(ctx, 35, 7) == 0) { return 0; }
+    Ctx::set(ctx, 272, base);
+    Ctx::set(ctx, 560, calleeModOff);
+    Ctx::set(ctx, 568, calleeModLen);
+    Ctx::set(ctx, 576, calleeMemOff);
+    Ctx::set(ctx, 584, calleeMemLen);
+    if (mode == 1) {
+        if (Parse::callEmit(ctx, argc, base) == 0) { return 0; }
+    } else {
+        if (Parse::builtinEmit(ctx, argc, base) == 0) { return 0; }
+    }
+    return Parse::expect(ctx, 39, 10);
+}
+
+create.mod Parse::stmt(ptr.int ctx).int {
+    create.int k = Ctx::get(ctx, 72);
+    if (k == 10) { return Parse::var(ctx); }
+    if (k == 22) { return Parse::emitStmt(ctx); }
+    if (k == 19) { return Parse::ret(ctx); }
+    if (k == 16) { return Parse::ifStmt(ctx); }
+    if (k == 18) { return Parse::whileStmt(ctx); }
+    if (k == 32) {
+        Lex::next(ctx);
+        return Parse::push(ctx, 4, 0, 0);
+    }
+    if (k == 2) { return Parse::identStmt(ctx); }
+    return Parse::fail(ctx, 12);
+}
+
+create.mod Parse::body(ptr.int ctx, int fnIdx).int {
+    if (Parse::expect(ctx, 32, 8) == 0) { return 0; }
+    Ctx::set(ctx, 272, 0);
+    if (Parse::push(ctx, 0, 0, 0) == 0) { return 0; }
+    while (1 == 1) {
+        create.int k = Ctx::get(ctx, 72);
+        if (k == 0) { return Parse::fail(ctx, 9); }
+        if (k == 33) {
+            create.int depth = Ctx::get(ctx, 520) - 1;
+            create.int kind = Blk::get(ctx, depth, 0);
+            create.int saved = Blk::get(ctx, depth, 8);
+            if (kind == 0) {
+                Lex::next(ctx);
+                Code::movImm64(ctx, 0, 0);
+                Code::movRspRbp(ctx);
+                Code::popRbp(ctx);
+                Code::ret(ctx);
+                create.int fs = Num::alignUp(8 * (68 + Ctx::get(ctx, 280)) + 32, 16);
+                Code::patch32(ctx, Ctx::get(ctx, 288), fs);
+                Ctx::set(ctx, 256, saved);
+                Ctx::set(ctx, 520, depth);
+                return 1;
+            }
+            if (kind == 1) {
+                Lex::next(ctx);
+                Ctx::set(ctx, 256, saved);
+                Ctx::set(ctx, 520, depth);
+                if (Ctx::get(ctx, 72) == 17) {
+                    Lex::next(ctx);
+                    create.int j2 = Code::jmp(ctx);
+                    Code::patchRel(ctx, Blk::get(ctx, depth, 16), Code::pos(ctx));
+                    if (Parse::expect(ctx, 32, 8) == 0) { return 0; }
+                    if (Parse::push(ctx, 2, j2, 0) == 0) { return 0; }
+                } else {
+                    Code::patchRel(ctx, Blk::get(ctx, depth, 16), Code::pos(ctx));
+                }
+            } else {
+                if (kind == 2) {
+                    Lex::next(ctx);
+                    Code::patchRel(ctx, Blk::get(ctx, depth, 16), Code::pos(ctx));
+                    Ctx::set(ctx, 256, saved);
+                    Ctx::set(ctx, 520, depth);
+                } else {
+                    if (kind == 3) {
+                        Lex::next(ctx);
+                        Code::jmpTo(ctx, Blk::get(ctx, depth, 32));
+                        Code::patchRel(ctx, Blk::get(ctx, depth, 16), Code::pos(ctx));
+                        Ctx::set(ctx, 256, saved);
+                        Ctx::set(ctx, 520, depth);
+                    } else {
+                        Lex::next(ctx);
+                        Ctx::set(ctx, 256, saved);
+                        Ctx::set(ctx, 520, depth);
+                    }
+                }
+            }
+        } else {
+            if (Parse::stmt(ctx) == 0) { return 0; }
+        }
+    }
+    return 1;
+}
+
+create.mod Parse::fnDecl(ptr.int ctx).int {
+    if (Parse::expect(ctx, 10, 1) == 0) { return 0; }
+    if (Parse::expect(ctx, 31, 2) == 0) { return 0; }
+    if (Parse::expect(ctx, 11, 3) == 0) { return 0; }
+    if (Ctx::get(ctx, 72) != 2) { return Parse::fail(ctx, 4); }
+    Ident::saveTo(ctx, 560);
+    Lex::next(ctx);
+    if (Parse::expect(ctx, 30, 5) == 0) { return 0; }
+    if (Ctx::get(ctx, 72) != 2) { return Parse::fail(ctx, 4); }
+    Ident::saveTo(ctx, 576);
+    Lex::next(ctx);
+    if (Parse::expect(ctx, 34, 6) == 0) { return 0; }
+    Ctx::set(ctx, 256, 0);
+    Ctx::set(ctx, 280, 0);
+    Ctx::set(ctx, 272, 0);
+    create.int pc = 0;
+    create.int more = 1;
+    if (Ctx::get(ctx, 72) == 35) { more = 0; }
+    while (more == 1) {
+        if (pc >= 4) { return Parse::fail(ctx, 15); }
+        create.int pty = Parse::valueType(ctx);
+        if (pty < 0) { return 0; }
+        if (Ctx::get(ctx, 72) != 2) { return Parse::fail(ctx, 4); }
+        create.int pi = Loc::addParamAt(ctx, pty, pc, 80);
+        if (pi < 0) { return 0; }
+        pc = pc + 1;
+        Lex::next(ctx);
+        if (Ctx::get(ctx, 72) == 38) {
+            Lex::next(ctx);
+        } else {
+            more = 0;
+        }
+    }
+    if (Parse::expect(ctx, 35, 7) == 0) { return 0; }
+    create.int rt = 4;
+    if (Ctx::get(ctx, 72) == 31) {
+        Lex::next(ctx);
+        rt = Parse::retType(ctx);
+        if (rt < 0) { return 0; }
+    }
+    if (Fn::findSaved(ctx) >= 0) { return Parse::fail(ctx, 19); }
+    create.int codePos = Code::pos(ctx);
+    create.int fidx = Fn::add(ctx, Ctx::get(ctx, 560), Ctx::get(ctx, 576), codePos);
+    if (fidx < 0) { return 0; }
+    Fn::set(ctx, fidx, 8, Ctx::get(ctx, 568));
+    Fn::set(ctx, fidx, 24, Ctx::get(ctx, 584));
+    Fn::set(ctx, fidx, 40, pc);
+    Fn::set(ctx, fidx, 80, rt);
+    create.int q = 0;
+    while (q < pc) {
+        Fn::set(ctx, fidx, 48 + q * 8, Loc::get(ctx, q, 32));
+        q = q + 1;
+    }
+    if (Ident::eqTok(ctx, 560, "Main") == 1 && Ident::eqTok(ctx, 576, "main") == 1) {
+        if (pc != 0) { return Parse::fail(ctx, 15); }
+        Ctx::set(ctx, 368, 1);
+        Ctx::set(ctx, 528, codePos);
+    }
+    Ctx::set(ctx, 296, rt);
+    Code::pushRbp(ctx);
+    Code::movRbpRsp(ctx);
+    Ctx::set(ctx, 288, Code::subRspPlaceholder(ctx));
+    if (pc > 0) { Code::movSlotReg(ctx, 64, 1); }
+    if (pc > 1) { Code::movSlotReg(ctx, 65, 2); }
+    if (pc > 2) { Code::movSlotReg(ctx, 66, 8); }
+    if (pc > 3) { Code::movSlotReg(ctx, 67, 9); }
+    if (Parse::body(ctx, fidx) == 0) { return 0; }
+    Fn::set(ctx, fidx, 88, 1);
+    Ctx::set(ctx, 256, 0);
+    Ctx::set(ctx, 280, 0);
+    Ctx::set(ctx, 272, 0);
+    return 1;
+}
+
+create.mod Parse::program(ptr.int ctx).int {
+    while (Ctx::get(ctx, 72) != 0) {
+        if (Ctx::get(ctx, 72) == 1) { return 0; }
+        if (Parse::fnDecl(ctx) == 0) { return 0; }
+    }
+    if (Ctx::get(ctx, 368) == 0) { return Parse::fail(ctx, 28); }
+    return 1;
+}
+
+create.mod Pe::selftest(ptr.int ctx, char outPath).int {
+    Ctx::set(ctx, 432, Cast::num(outPath));
+    Code::seek(ctx, 64);
+    Code::pushRbp(ctx);
+    Code::movRbpRsp(ctx);
+    Code::subRspImm(ctx, 32);
+    create.int p = Code::leaRip(ctx, 1);
+    Fix::addData(ctx, p, 528);
+    p = Code::leaRip(ctx, 2);
+    Fix::addData(ctx, p, 544);
+    Code::xorEax(ctx);
+    Code::callIat(ctx, 0);
+    Code::movRspRbp(ctx);
+    Code::popRbp(ctx);
+    Code::ret(ctx);
+    create.ptr.int data = Cast::toPtr(Ctx::get(ctx, 208));
+    create.char msg = "Hello, bootstrap!";
+    create.int i = 0;
+    while (__byte_at(msg, i) != 0) {
+        __store_byte(data, 544 + i, __byte_at(msg, i));
+        i = i + 1;
+    }
+    __store_byte(data, 544 + i, 0);
+    Ctx::set(ctx, 224, 544 + i + 1);
+    create.ptr.int out = Cast::toPtr(Ctx::get(ctx, 440));
+    return Pe::build(ctx, out, Ctx::get(ctx, 448), 64);
+}
+
+// Non-zero arity on purpose: stage0 auto-invokes every zero-arg mod member
+// at startup (see src/BOOTSTRAP.md section 6.6).
+create.mod Pe::runSelfTest(int mode).int {
+    create.ptr.int ctxRaw = Mem::alloc(131072);
+    create.ptr.int ctx = ctxRaw;
+    create.ptr.int dataRaw = Mem::alloc(1048576);
+    create.ptr.int data = dataRaw;
+    create.ptr.int codeRaw = Mem::alloc(4194304);
+    create.ptr.int code = codeRaw;
+    create.ptr.int outRaw = Mem::alloc(8388608);
+    create.ptr.int out = outRaw;
+    create.ptr.int fixRaw = Mem::alloc(1048576);
+    create.ptr.int fix = fixRaw;
+    create.ptr.int iatRaw = Mem::alloc(1048576);
+    create.ptr.int iat = iatRaw;
+    Data::init(ctx, data, 1048576);
+    Code::init(ctx, code, 4194304);
+    Fix::init(ctx, fix, iat);
+    Ctx::set(ctx, 440, Cast::num(out));
+    Ctx::set(ctx, 448, 8388608);
+    create.int wrote = Pe::selftest(ctx, "pe-selftest.exe");
+    Mem::free(iatRaw);
+    Mem::free(fixRaw);
+    Mem::free(outRaw);
+    Mem::free(codeRaw);
+    Mem::free(dataRaw);
+    Mem::free(ctxRaw);
+    return wrote;
+}
+
+// Keep this as a direct-return helper: stage0 miscompiles a loop-carried
+// boolean flag in large functions (see src/BOOTSTRAP.md section 6.1).
+create.mod Cli::stdOk(char opt).int {
+    if (Str::eqRest(opt, 5, "wei27") == 1) {
+        return 1;
+    }
+    if (Str::eqRest(opt, 5, "wei") == 1) {
+        return 1;
+    }
+    if (Str::eqRest(opt, 5, "default") == 1) {
+        return 1;
+    }
+    return 0;
+}
+
+create.mod Msg::missing(char name) {
+    create.ptr.int raw = Mem::alloc(512);
+    create.char msg = Cast::text(raw);
+    create.int n = Str::append(msg, 0, 512, "error: subcommand '");
+    n = Str::append(msg, n, 512, name);
+    Str::append(msg, n, 512, "' requires a file");
+    do.emit::msg;
+    Mem::free(raw);
+}
+
+create.mod Msg::unknown(char name) {
+    create.ptr.int raw = Mem::alloc(512);
+    create.char msg = Cast::text(raw);
+    create.int n = Str::append(msg, 0, 512, "error: unknown subcommand '");
+    n = Str::append(msg, n, 512, name);
+    Str::append(msg, n, 512, "'");
+    do.emit::msg;
+    do.emit::"usage: bootstrap build <file.wei> [-o out.exe] [-std:wei27]";
+    Mem::free(raw);
+}
+
+create.mod Main::main() {
+    create.int argc = Cmd::argc();
+    create.ptr.int rawA1 = Mem::alloc(64);
+    create.char a1 = Cast::text(rawA1);
+    create.ptr.int rawFile = Mem::alloc(4096);
+    create.char file = Cast::text(rawFile);
+    create.ptr.int rawOpt = Mem::alloc(4096);
+    create.char opt = Cast::text(rawOpt);
+    create.ptr.int rawOut = Mem::alloc(4096);
+    create.char out = Cast::text(rawOut);
+    create.int outSet = 0;
+    create.int i = 3;
+
+    if (argc <= 1) {
+        do.emit::"Module Target Generator - bootstrap stage1";
+        Mem::free(rawA1);
+        Mem::free(rawFile);
+        Mem::free(rawOpt);
+        Mem::free(rawOut);
+        return;
+    }
+
+    Cmd::arg(1, a1, 64);
+    if (Str::eq(a1, "selftest-pe") == 1) {
+        create.int wrote = Pe::runSelfTest(0);
+        do.emit::"pe selftest bytes";
+        do.emit::wrote;
+        if (wrote == 0) {
+            __exit(1);
+            return;
+        }
+        __exit(0);
+        return;
+    }
+    if (Str::eq(a1, "version") == 1 || Str::eq(a1, "-v") == 1 || Str::eq(a1, "--version") == 1) {
+        do.emit::"Module Target Generator 0.02.74282 - bootstrap stage1 (win64)";
+        Mem::free(rawA1);
+        Mem::free(rawFile);
+        Mem::free(rawOpt);
+        Mem::free(rawOut);
+        return;
+    }
+
+    if (Str::eq(a1, "build") == 0) {
+        if (argc < 3) {
+            Msg::missing(a1);
+            Mem::free(rawA1);
+            Mem::free(rawFile);
+            Mem::free(rawOpt);
+            Mem::free(rawOut);
+            __exit(2);
+            return;
+        }
+        Msg::unknown(a1);
+        Mem::free(rawA1);
+        Mem::free(rawFile);
+        Mem::free(rawOpt);
+        Mem::free(rawOut);
+        __exit(2);
+        return;
+    }
+
+    if (argc < 3) {
+        do.emit::"error: subcommand 'build' requires a file";
+        Mem::free(rawA1);
+        Mem::free(rawFile);
+        Mem::free(rawOpt);
+        Mem::free(rawOut);
+        __exit(2);
+        return;
+    }
+
+    Cmd::arg(2, file, 4096);
+
+    while (i < argc) {
+        Cmd::arg(i, opt, 4096);
+        if (Str::eq(opt, "-o") == 1) {
+            i = i + 1;
+            if (i >= argc) {
+                do.emit::"error: option '-o' requires a value";
+                Mem::free(rawA1);
+                Mem::free(rawFile);
+                Mem::free(rawOpt);
+                Mem::free(rawOut);
+                __exit(2);
+                return;
+            }
+            Cmd::arg(i, out, 4096);
+            outSet = 1;
+        } else {
+            if (Str::starts(opt, "-std:") == 1) {
+                if (Cli::stdOk(opt) == 0) {
+                    do.emit::"error: unsupported -std value";
+                    Mem::free(rawA1);
+                    Mem::free(rawFile);
+                    Mem::free(rawOpt);
+                    Mem::free(rawOut);
+                    __exit(2);
+                    return;
+                }
+            } else {
+                if (Str::eq(opt, "-target") == 1) {
+                    i = i + 1;
+                    if (i >= argc) {
+                        do.emit::"error: option '-target' requires a value";
+                        Mem::free(rawA1);
+                        Mem::free(rawFile);
+                        Mem::free(rawOpt);
+                        Mem::free(rawOut);
+                        __exit(2);
+                        return;
+                    }
+                    Cmd::arg(i, opt, 4096);
+                    if (Str::eq(opt, "win64") == 0) {
+                        do.emit::"error: target is not supported";
+                        Mem::free(rawA1);
+                        Mem::free(rawFile);
+                        Mem::free(rawOpt);
+                        Mem::free(rawOut);
+                        __exit(2);
+                        return;
+                    }
+                } else {
+                    if (Str::eq(opt, "-wide") == 1 || Str::starts(opt, "-emit-norm:") == 1) {
+                        do.emit::"error: option is not supported";
+                        Mem::free(rawA1);
+                        Mem::free(rawFile);
+                        Mem::free(rawOpt);
+                        Mem::free(rawOut);
+                        __exit(2);
+                        return;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    if (outSet == 0) {
+        Path::outName(file, out, 4096);
+    }
+
+    create.ptr.int src = Mem::alloc(1048577);
+    create.int n = __read_file(file, src, 1048577);
+    if (n <= 0) {
+        Msg::fileErr(file, "cannot read source file (missing or empty)");
+        Mem::free(src);
+        Mem::free(rawA1);
+        Mem::free(rawFile);
+        Mem::free(rawOpt);
+        Mem::free(rawOut);
+        __exit(1);
+        return;
+    }
+    if (n > 1048576) {
+        Msg::fileErr(file, "source exceeds 1048576 bytes");
+        Mem::free(src);
+        Mem::free(rawA1);
+        Mem::free(rawFile);
+        Mem::free(rawOpt);
+        Mem::free(rawOut);
+        __exit(1);
+        return;
+    }
+    __store_byte(src, n, 0);
+    do.emit::"DBG read ok";
+
+    create.ptr.int ctxRaw = Mem::alloc(131072);
+    do.emit::"DBG a1";
+    create.ptr.int ctx = ctxRaw;
+    create.ptr.int dataRaw = Mem::alloc(1048576);
+    do.emit::"DBG a2";
+    create.ptr.int data = dataRaw;
+    create.ptr.int codeRaw = Mem::alloc(4194304);
+    do.emit::"DBG a3";
+    create.ptr.int code = codeRaw;
+    create.ptr.int outRaw = Mem::alloc(8388608);
+    do.emit::"DBG a4";
+    create.ptr.int outBuf = outRaw;
+    create.ptr.int fixRaw = Mem::alloc(1048576);
+    do.emit::"DBG a5";
+    create.ptr.int fix = fixRaw;
+    create.ptr.int iatRaw = Mem::alloc(1048576);
+    do.emit::"DBG a6";
+    create.ptr.int iat = iatRaw;
+    create.ptr.int funcRaw = Mem::alloc(65536);
+    do.emit::"DBG a7";
+    create.ptr.int funcs = funcRaw;
+    create.ptr.int localRaw = Mem::alloc(65536);
+    do.emit::"DBG a8";
+    create.ptr.int locals = localRaw;
+
+    Data::init(ctx, data, 1048576);
+    do.emit::"DBG data";
+    Code::init(ctx, code, 4194304);
+    do.emit::"DBG code";
+    Fix::init(ctx, fix, iat);
+    do.emit::"DBG fix";
+    Ctx::set(ctx, 232, Cast::num(funcs));
+    Ctx::set(ctx, 240, 0);
+    Ctx::set(ctx, 248, Cast::num(locals));
+    Ctx::set(ctx, 256, 0);
+    Ctx::set(ctx, 264, 0);
+    Ctx::set(ctx, 272, 0);
+    Ctx::set(ctx, 280, 0);
+    Ctx::set(ctx, 296, 4);
+    Ctx::set(ctx, 368, 0);
+    Ctx::set(ctx, 432, Cast::num(out));
+    Ctx::set(ctx, 440, Cast::num(outBuf));
+    Ctx::set(ctx, 448, 8388608);
+    Ctx::set(ctx, 456, 0);
+    Ctx::set(ctx, 464, 0);
+    Ctx::set(ctx, 472, 0);
+    Ctx::set(ctx, 480, 0);
+    Ctx::set(ctx, 488, 0);
+    Ctx::set(ctx, 496, 0);
+    Ctx::set(ctx, 504, 0);
+    Ctx::set(ctx, 512, 0);
+    Ctx::set(ctx, 520, 0);
+    Rt::init(ctx);
+    do.emit::"DBG rt";
+    Lex::init(ctx, src, n);
+    do.emit::"DBG lex";
+    if (Ctx::get(ctx, 72) == 1) {
+        Err::report(ctx, file);
+        Mem::free(localRaw);
+        Mem::free(funcRaw);
+        Mem::free(iatRaw);
+        Mem::free(fixRaw);
+        Mem::free(outRaw);
+        Mem::free(codeRaw);
+        Mem::free(dataRaw);
+        Mem::free(ctxRaw);
+        Mem::free(src);
+        Mem::free(rawA1);
+        Mem::free(rawFile);
+        Mem::free(rawOpt);
+        Mem::free(rawOut);
+        __exit(1);
+        return;
+    }
+    do.emit::"DBG parse begin";
+    if (Parse::program(ctx) == 0) {
+        Err::report(ctx, file);
+        Mem::free(localRaw);
+        Mem::free(funcRaw);
+        Mem::free(iatRaw);
+        Mem::free(fixRaw);
+        Mem::free(outRaw);
+        Mem::free(codeRaw);
+        Mem::free(dataRaw);
+        Mem::free(ctxRaw);
+        Mem::free(src);
+        Mem::free(rawA1);
+        Mem::free(rawFile);
+        Mem::free(rawOpt);
+        Mem::free(rawOut);
+        __exit(1);
+        return;
+    }
+    do.emit::"DBG parse ok";
+    create.int wrote = Pe::build(ctx, outBuf, 8388608, Ctx::get(ctx, 528));
+    do.emit::"DBG pe ok";
+    if (wrote == 0) {
+        Msg::fileErr(file, "cannot write output file");
+        Mem::free(localRaw);
+        Mem::free(funcRaw);
+        Mem::free(iatRaw);
+        Mem::free(fixRaw);
+        Mem::free(outRaw);
+        Mem::free(codeRaw);
+        Mem::free(dataRaw);
+        Mem::free(ctxRaw);
+        Mem::free(src);
+        Mem::free(rawA1);
+        Mem::free(rawFile);
+        Mem::free(rawOpt);
+        Mem::free(rawOut);
+        __exit(1);
+        return;
+    }
+    Msg::done(out);
+    Mem::free(localRaw);
+    Mem::free(funcRaw);
+    Mem::free(iatRaw);
+    Mem::free(fixRaw);
+    Mem::free(outRaw);
+    Mem::free(codeRaw);
+    Mem::free(dataRaw);
+    Mem::free(ctxRaw);
+    Mem::free(src);
+    Mem::free(rawA1);
+    Mem::free(rawFile);
+    Mem::free(rawOpt);
+    Mem::free(rawOut);
+    __exit(0);
+    return;
+}

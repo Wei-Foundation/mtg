@@ -161,6 +161,16 @@ mtg build hello-wenyan.wei -std:wenyan -o hello-wenyan.exe
 
 该程序输出 `10`。
 
+### 文言文扫雷
+
+根目录的 `saolei.wenyan.wei` 是一个可玩的扫雷游戏：九道棋盘、十枚雷，首击必安。
+以 `1` 发土、`2` 树旗、`4` 新局、`0` 退出；棋盘与计数用汉字显示。
+
+```bash
+mtg build saolei.wenyan.wei -std:wenyan -o saolei.exe
+./saolei.exe
+```
+
 ---
 
 ## 从源码构建
@@ -201,8 +211,50 @@ g++ -std=c++26 -O3 -o mtg src/main.cpp
 Windows 下对应命令为 `mtg.exe --version`。如果能正常打印版本号，就可以开始
 编译 Wei 程序了。
 
-`make check` 会构建并打印版本，`make clean` 会删除构建产物；Windows 下请将
-`make` 换成 `mingw32-make`。
+`make check` 会构建并打印版本，`make bootstrap-check` 会运行子集验收脚本，
+`make clean` 会删除构建产物；Windows 下请将 `make` 换成 `mingw32-make`。
+
+---
+
+## 子集自举（进行中）
+
+仓库正在用 Wei 语言实现一个可自编译的编译器子集，路线为：
+
+```text
+mtg.exe（stage0）→ bootstrap.exe（stage1）→ bootstrap2.exe（stage2）
+→ bootstrap3.exe；要求 bootstrap2 与 bootstrap3 字节级一致
+```
+
+- 冻结规格：[`src/BOOTSTRAP.md`](src/BOOTSTRAP.md)
+- stage1 源码：[`src/bootstrap.wei`](src/bootstrap.wei)
+- 验收用例：[`tests/bootstrap/`](tests/bootstrap/)
+
+当前只覆盖 10 天版子集：`Main::main`、整数/字符串变量、赋值、算术、比较、
+`do.emit::`、`if` / `while`、函数调用、一维定长数组、Windows x64 PE，以及
+`__command_line`、`__exit`、`__byte_at`、`__store_byte`、`__rt_alloc`、
+`__rt_free`、`__read_file`、`__write_file`。模块/部件全局状态、元组、
+模式匹配、IR、优化器、Linux ELF 与中文/文言方言不在本阶段范围内。
+
+构建 stage1：
+
+```powershell
+.\mtg.exe build src\bootstrap.wei -o bootstrap.exe
+```
+
+运行 stage0 语义验收：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\bootstrap\run.ps1
+```
+
+CLI 契约检查（默认允许 Day 1 的“尚未实现代码生成”状态）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\bootstrap\cli.ps1 -Compiler .\bootstrap.exe
+```
+
+第 1 天（2026-10-28）状态：10/10 验收用例通过；`bootstrap.wei` 的 CLI 骨架
+可编译并完成参数解析、源文件读取与退出码处理，词法分析器和代码生成器尚未接入。
 
 ---
 
@@ -210,6 +262,10 @@ Windows 下对应命令为 `mtg.exe --version`。如果能正常打印版本号�
 
 ```text
 src/main.cpp          # 编译器实现：前端、优化与 x86-64 代码生成
+src/BOOTSTRAP.md      # 子集自举冻结规格（语法、ABI、内存布局、CLI、验收）
+src/bootstrap.wei     # stage1 自举源码（子集 CLI 骨架）
+tests/bootstrap/      # 10 个子集验收程序、期望输出与 run.ps1
+saolei.wenyan.wei     # 文言文扫雷示例（九道棋盘、十雷、首击安全）
 Makefile              # 跨平台构建脚本
 build.bat             # Windows 一键构建脚本
 .gitignore            # Git 忽略规则

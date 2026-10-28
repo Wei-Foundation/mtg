@@ -5068,6 +5068,12 @@ namespace wei::types {
 					}
 					return {TypeKind::Void, ""};
 				}
+				if (node.callee == "__exit") {
+					if (node.args.size() != 1) {
+						throw std::runtime_error("__exit 参数数量错误 at " + std::to_string(node.line) + ":" + std::to_string(node.col));
+					}
+					return {TypeKind::Void, ""};
+				}
 				/* ── 128 位整数运算原语 ── 均为 (int,int) -> int */
 				if (node.callee == "__mulhi" || node.callee == "__umulhi" ||
 				    node.callee == "__mullo" || node.callee == "__umullo" ||
@@ -8979,6 +8985,7 @@ struct LoopOptimizer {
 
 	bool NativeGen::is_builtin_call(const std::string& name) const {
 		return name == "__command_line" || name == "__byte_at" || name == "__store_byte" || name == "__read_file" || name == "__write_file" ||
+		       name == "__exit" ||
 		       name == "__file_open" || name == "__file_write" || name == "__file_close" ||
 		       name == "__rt_alloc" || name == "__rt_free" || name == "__rt_panic" ||
 		       /* ── 128 位整数运算原语 ──
@@ -9644,6 +9651,22 @@ struct LoopOptimizer {
 				throw std::runtime_error("__rt_panic 参数数量错误 at " + std::to_string(n.line) + ":" + std::to_string(n.col));
 			}
 			emit_call_off(panic_generic_off_);  /* 不返回 */
+			return;
+		}
+		if (n.callee == "__exit") {
+			if (n.args.size() != 1) {
+				throw std::runtime_error("__exit 参数数量错误 at " + std::to_string(n.line) + ":" + std::to_string(n.col));
+			}
+			if (!target_ || std::string(target_->id()) != "win64") {
+				throw std::runtime_error("__exit 当前仅支持 win64 at " + std::to_string(n.line) + ":" + std::to_string(n.col));
+			}
+			gen_expr(*n.args[0]);
+			c_.mov64r_rm64(1, 0);              /* rcx = exit code */
+			c_.save_rsp_r15();
+			c_.align_rsp16();
+			size_t call_pos = c_.call_rip();   /* 返回 disp32 字段位置 */
+			pe_iat_patches_.push_back({call_pos, 1});
+			c_.u8(0xCC);                       /* ExitProcess 不返回 */
 			return;
 		}
 		/* ── 128 位整数运算原语 ────────────────────────────────────────────
@@ -11787,6 +11810,7 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 							self->gen_block(n.else_body);
 						}
 					}
+					self->last_store_len_ = (size_t) -1;
 					return;
 				}
 				if (auto* il = std::get_if<IntLit>(n.cond.get())) {
@@ -11799,6 +11823,7 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 							self->gen_block(n.else_body);
 						}
 					}
+					self->last_store_len_ = (size_t) -1;
 					return;
 				}
 				self->gen_expr(*n.cond);
@@ -11814,6 +11839,10 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 				} else {
 					self->patch(jmp_else);
 				}
+				/* 合并点: 两条路径都可能没执行过任何写槽指令,
+				   禁止 Ident 复用 RAX 跳过加载。 */
+				self->last_store_len_ = (size_t) -1;
+				self->last_store_slot_ = -1;
 			}
 			/* 条件直接生成分支跳转（不把结果 materialize 成 0/1）。
 			   原路径: 比较 → setcc → movzbq → cmp $0 → je，四条冗余指令。
@@ -13584,7 +13613,8 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 			return 104;  /* 13 个 IAT 槽: printf/fopen/fread/fwrite/fclose/GetStdHandle/ReadFile/ExitProcess/VirtualAlloc/VirtualProtect/SetConsoleOutputCP/SetConsoleCP/GetCommandLineA */
 		}
 		size_t fmtOffset(int kind) const override {
-			return (kind == 3) ? 112 : (kind == 0) ? 96 : 104;
+			/* 13 个 IAT 槽之后才是格式串：%lld / %s / %g 各占 8 字节。 */
+			return (kind == 3) ? 120 : (kind == 0) ? 104 : 112;
 		}
 		void emitDataPrologue(NativeGen& g) override {
 			for (int i = 0; i < 13; i++) g.c_.u64(0);
@@ -13815,13 +13845,15 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 		}
 		void emitEntryStub(NativeGen& g) override {
 			/* Win64 进程入口 RSP ≡ 8 (mod 16)。
-			   push rbp 后为 0，sub 0x20 后仍为 0：
+			   push rbp 后为 0，sub 0x30 后仍为 0：
 			   - VirtualProtect 前 RSP ≡ 0，callee 入口拿到 8；
 			   - call main 前 RSP ≡ 0（callee 入口拿到 8）；
-			   - 0x20 字节 shadow space 留给两次调用；main 返回后 RSP 仍为 0。 */
+			   - 0x20 字节 shadow space 留给调用，另留 8 字节保存 main 的返回值。
+			   旧代码把返回值放 ECX 后调用泄漏检查，ECX 被格式串指针覆盖，
+			   导致所有程序的退出码都不可靠。 */
 			g.c_.push_rbp();
 			g.c_.mov_rbp_rsp();
-			g.c_.sub_rsp(0x20);
+			g.c_.sub_rsp(0x30);
 
 			/* VirtualProtect(entry, code_size, PAGE_EXECUTE_READ, &old)：
 			   显式把 .text 锁成 RX（PE 头本身也是 RX，这里是运行期双保险）。 */
@@ -13860,9 +13892,16 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 			size_t main_call_pos = g.c_.pos();
 			g.c_.u8(0xE8);
 			g.c_.u32(0);
+			/* 保存 main 的返回值，泄漏检查后再装入 RCX 交给 ExitProcess。 */
 			g.c_.u8(0x89);
-			g.c_.u8(0xC1);                          /* mov ecx, eax */
+			g.c_.u8(0x44);
+			g.c_.u8(0x24);
+			g.c_.u8(0x20);                          /* mov [rsp+0x20], eax */
 			g.emit_call_off(g.rt_leak_off_);        /* 退出前泄漏报告 */
+			g.c_.u8(0x8B);
+			g.c_.u8(0x4C);
+			g.c_.u8(0x24);
+			g.c_.u8(0x20);                          /* mov ecx, [rsp+0x20] */
 			size_t exit_call_pos = g.c_.pos();
 			g.c_.call_rip();
 			g.pe_iat_patches_.push_back({exit_call_pos + 2, 1});
@@ -14032,7 +14071,7 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 				g.c_.patch_u32(p.pos, static_cast<uint32_t>(rip_disp));
 			}
 			for (auto& p : g.pe_fmt_patches_) {
-				size_t off = (p.kind == 3) ? 112 : (p.kind == 0) ? 96 : 104;
+				size_t off = (p.kind == 3) ? 120 : (p.kind == 0) ? 104 : 112;
 				int32_t rip_disp = static_cast<int32_t>(g.pe_data_rel_ + off - (p.pos + 4));
 				g.c_.patch_u32(p.pos, static_cast<uint32_t>(rip_disp));
 			}
@@ -14057,8 +14096,9 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 			const char* dll_name = "msvcrt.dll";
 			const char* dll_k32 = "kernel32.dll";
 			const char* fns_m[5] = {"printf", "fopen", "fread", "fwrite", "fclose"};
-			const char* fns_k[7] = {"GetStdHandle", "ReadFile", "ExitProcess", "VirtualAlloc",
-			                        "VirtualProtect", "SetConsoleOutputCP", "SetConsoleCP"
+			const char* fns_k[8] = {"GetStdHandle", "ReadFile", "ExitProcess", "VirtualAlloc",
+			                        "VirtualProtect", "SetConsoleOutputCP", "SetConsoleCP",
+			                        "GetCommandLineA"
 			                       };
 			uint32_t dll_name_len = (uint32_t)strlen(dll_name) + 1;
 			uint32_t dll_k32_len = (uint32_t)strlen(dll_k32) + 1;
@@ -14068,13 +14108,13 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 			uint32_t ilt_msvcrt_off = import_dir_off + sizeof(IMAGE_IMPORT_DESCRIPTOR) * 3;
 			uint32_t ilt_k32_off = ilt_msvcrt_off + 8 * 6;
 			uint32_t hint_m[5] = {};
-			uint32_t hint_k[7] = {};
-			uint32_t names_at = ilt_k32_off + 8 * 8;
+			uint32_t hint_k[8] = {};
+			uint32_t names_at = ilt_k32_off + 8 * 9;
 			for (int i = 0; i < 5; i++) {
 				hint_m[i] = names_at;
 				names_at += 2 + (uint32_t)strlen(fns_m[i]) + 1;
 			}
-			for (int i = 0; i < 7; i++) {
+			for (int i = 0; i < 8; i++) {
 				hint_k[i] = names_at;
 				names_at += 2 + (uint32_t)strlen(fns_k[i]) + 1;
 			}
@@ -14098,7 +14138,7 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 
 			uint64_t* iat = (uint64_t*)idata.data();
 			for (int i = 0; i < 5; i++) iat[i] = idata_base + hint_m[i];
-			for (int i = 0; i < 7; i++) iat[5 + i] = idata_base + hint_k[i];
+			for (int i = 0; i < 8; i++) iat[5 + i] = idata_base + hint_k[i];
 
 			IMAGE_IMPORT_DESCRIPTOR* imp_dir = (IMAGE_IMPORT_DESCRIPTOR*)(idata.data() + import_dir_off);
 			imp_dir[0].OriginalFirstThunk = idata_base + ilt_msvcrt_off;
@@ -14113,8 +14153,8 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 			for (int i = 0; i < 5; i++) ilt_m[i] = idata_base + hint_m[i];
 			ilt_m[5] = 0;
 			uint64_t* ilt_k = (uint64_t*)(idata.data() + ilt_k32_off);
-			for (int i = 0; i < 7; i++) ilt_k[i] = idata_base + hint_k[i];
-			ilt_k[7] = 0;
+			for (int i = 0; i < 8; i++) ilt_k[i] = idata_base + hint_k[i];
+			ilt_k[8] = 0;
 
 			for (int i = 0; i < 5; i++) {
 				uint32_t len = (uint32_t)strlen(fns_m[i]) + 1;
@@ -14122,7 +14162,7 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 				idata[hint_m[i] + 1] = 0;
 				memcpy(idata.data() + hint_m[i] + 2, fns_m[i], len);
 			}
-			for (int i = 0; i < 7; i++) {
+			for (int i = 0; i < 8; i++) {
 				uint32_t len = (uint32_t)strlen(fns_k[i]) + 1;
 				idata[hint_k[i]] = 0;
 				idata[hint_k[i] + 1] = 0;
