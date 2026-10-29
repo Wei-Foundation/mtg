@@ -13,6 +13,20 @@
 
 ---
 
+## 目录
+
+- [简介](#简介)
+- [快速开始](#快速开始)
+- [语言示例](#语言示例)
+  - [文言文扫雷](#文言文扫雷)
+- [从源码构建](#从源码构建)
+- [子集自举（进行中）](#子集自举进行中)
+- [项目结构](#项目结构)
+- [参与贡献](#参与贡献)
+- [许可证](#许可证)
+
+---
+
 ## 简介
 
 **Module Target Generator** 是维语言（Wei）的原生编译器。它把 `.wei`
@@ -28,6 +42,8 @@
 - 可选实验性 IR 路径（三地址码 + 线性扫描寄存器分配）
 
 > `-ir` 与 `-wide` 目前属于实验特性，不建议在生产代码中依赖。
+
+仓库还附有一个用文言方言编写的[扫雷示例](#文言文扫雷)，可直接编译游玩。
 
 ---
 
@@ -68,6 +84,9 @@ Linux：
 ```
 
 ### 命令格式
+
+> 下文以 `mtg` 表示编译器可执行文件；Windows 下若未将其加入 `PATH`，请写作
+> `.\mtg.exe`。
 
 ```text
 mtg build <文件.wei> [选项]
@@ -163,13 +182,81 @@ mtg build hello-wenyan.wei -std:wenyan -o hello-wenyan.exe
 
 ### 文言文扫雷
 
-根目录的 `saolei.wenyan.wei` 是一个可玩的扫雷游戏：九道棋盘、十枚雷，首击必安。
-以 `1` 发土、`2` 树旗、`4` 新局、`0` 退出；棋盘与计数用汉字显示。
+[`saolei.wenyan.wei`](saolei.wenyan.wei) 是一个用文言方言写成的可玩扫雷，
+示范了数组、循环、函数、字符串拼接与栈式漫延。棋盘九道（9×9），藏雷十枚。您可以通过此文件，来基本了解文言文维语言的基本语法。
+
+Windows 下编译运行：
+
+```bat
+.\mtg.exe build saolei.wenyan.wei -std:wenyan -o saolei.exe
+.\saolei.exe
+```
+
+Linux/macOS 下：
 
 ```bash
-mtg build saolei.wenyan.wei -std:wenyan -o saolei.exe
-./saolei.exe
+mtg build saolei.wenyan.wei -std:wenyan -o saolei
+./saolei
 ```
+
+**操作**
+
+| 输入 | 动作 |
+| --- | --- |
+| `1` | 发土（翻开一格） |
+| `2` | 树旗 / 拔旗 |
+| `4` | 新局 |
+| `0` | 退出 |
+
+选择 `1` 或 `2` 后，再依次输入行、列（`1`～`9`）。终局后可输入 `1` 再局、
+`0` 退出。
+
+**规则**
+
+- 首击必安：第一次发土后才布雷，并避开该格周围九宫。
+- 空白格向八邻自动漫延；数字格显示周围八格的雷数。
+- 最多树十面旗；翻开全部 71 个安全格即胜，触雷即败。
+- 胜局将所有雷显示为 `旗`；败局将错旗显示为 `誤`。
+
+**棋盘符号**
+
+| 符号 | 含义 |
+| --- | --- |
+| `■` | 未翻开 |
+| `□` | 已翻开的空白格 |
+| `一`～`八` | 周围八格的雷数 |
+| `旗` | 已树旗 |
+| `雷` | 败局中显示的雷 |
+| `爆` | 触发的雷 |
+| `誤` | 败局中显示的错旗 |
+
+棋盘、行列与计数用汉字数字显示；命令与坐标输入使用阿拉伯数字。
+
+首击 `5,5` 后的示例局面：
+
+```text
+《掃雷》　九道縱橫，十雷潛伏
+
+餘雷：十　已開：五十三／七十一
+
+　　一 二 三 四 五 六 七 八 九
+一　■ ■ ■ ■ ■ ■ 一 □ □
+二　■ ■ ■ ■ ■ ■ 二 一 □
+三　■ ■ ■ 一 一 三 ■ 二 □
+四　■ ■ ■ 一 □ 二 ■ 二 □
+五　■ 二 一 一 □ 一 一 一 □
+六　一 一 □ □ □ □ □ □ □
+七　□ □ □ □ □ □ □ □ □
+八　一 一 二 一 一 一 一 一 □
+九　■ ■ ■ ■ ■ ■ ■ 一 □
+
+雷潛於下，慎爾所發。
+1 發土　2 樹旗　4 新局　0 退出
+```
+
+源码约 370 行，入口为 `create.mod Main::main()`；雷区、状态、邻雷数与漫延栈
+各用一个 81 元素的数组表示。汉字数字拆成 `漢字`、`漢尾`、`漢數` 三个函数生成，
+避免在函数调用后直接接条件分支。
 
 ---
 
@@ -208,11 +295,12 @@ g++ -std=c++26 -O3 -o mtg src/main.cpp
 ./mtg --version
 ```
 
-Windows 下对应命令为 `mtg.exe --version`。如果能正常打印版本号，就可以开始
+Windows 下对应命令为 `.\mtg.exe --version`。如果能正常打印版本号，就可以开始
 编译 Wei 程序了。
 
-`make check` 会构建并打印版本，`make bootstrap-check` 会运行子集验收脚本，
-`make clean` 会删除构建产物；Windows 下请将 `make` 换成 `mingw32-make`。
+`make check` 会构建并打印版本，`make bootstrap-check` 会运行子集语义验收，
+`make bootstrap-fixpoint` 会验证 stage2/stage3 字节级一致，`make clean` 会删除
+构建产物；Windows 下请将 `make` 换成 `mingw32-make`。
 
 ---
 
@@ -241,20 +329,30 @@ mtg.exe（stage0）→ bootstrap.exe（stage1）→ bootstrap2.exe（stage2）
 .\mtg.exe build src\bootstrap.wei -o bootstrap.exe
 ```
 
-运行 stage0 语义验收：
+运行子集语义验收（`-Compiler` 可指定 stage0、stage1 或 stage2）：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\bootstrap\run.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\bootstrap\run.ps1 -Compiler .\bootstrap2.exe
 ```
 
-CLI 契约检查（默认允许 Day 1 的“尚未实现代码生成”状态）：
+CLI 契约检查（`-RequireBuildSuccess` 额外要求编译器能重建 `src/bootstrap.wei`）：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tests\bootstrap\cli.ps1 -Compiler .\bootstrap.exe
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\bootstrap\cli.ps1 -Compiler .\bootstrap2.exe -RequireBuildSuccess
 ```
 
-第 1 天（2026-10-28）状态：10/10 验收用例通过；`bootstrap.wei` 的 CLI 骨架
-可编译并完成参数解析、源文件读取与退出码处理，词法分析器和代码生成器尚未接入。
+验证 fixpoint（stage0 → stage1 → stage2 → stage3）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\bootstrap\fixpoint.ps1
+# 或
+mingw32-make bootstrap-fixpoint
+```
+
+当前状态（2026-10-28）：stage0、stage1、stage2 下 10/10 语义验收通过；
+CLI 契约 21/21 通过；`bootstrap2.exe` 与 `bootstrap3.exe` 字节级一致
+（SHA256 `8C57ADE1C319A9196E5B629235DB32F2AF253EE7CACD0BF9B60F417C268E725E`）。
 
 ---
 
@@ -263,8 +361,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\bootstrap\cli.ps1 -Com
 ```text
 src/main.cpp          # 编译器实现：前端、优化与 x86-64 代码生成
 src/BOOTSTRAP.md      # 子集自举冻结规格（语法、ABI、内存布局、CLI、验收）
-src/bootstrap.wei     # stage1 自举源码（子集 CLI 骨架）
-tests/bootstrap/      # 10 个子集验收程序、期望输出与 run.ps1
+src/bootstrap.wei     # stage1 自举源码（子集编译器完整实现）
+tests/bootstrap/      # 10 个子集验收程序、run.ps1、cli.ps1、fixpoint.ps1
 saolei.wenyan.wei     # 文言文扫雷示例（九道棋盘、十雷、首击安全）
 Makefile              # 跨平台构建脚本
 build.bat             # Windows 一键构建脚本

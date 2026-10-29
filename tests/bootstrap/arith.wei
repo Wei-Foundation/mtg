@@ -1,0 +1,11 @@
+create.mod Main::main() {
+    create.int a = 7;
+    create.int b = 3;
+    do.emit::a + b;
+    do.emit::a - b;
+    do.emit::a * b;
+    do.emit::a / b;
+    do.emit::a % b;
+    do.emit::-a;
+    do.emit::(a + b) * 2;
+}

@@ -1,6 +1,9 @@
 # 构建产物
 /mtg
 /mtg.exe
+/bootstrap.exe
+/bootstrap2.exe
+/bootstrap3.exe
 *.o
 *.obj
 *.pdb

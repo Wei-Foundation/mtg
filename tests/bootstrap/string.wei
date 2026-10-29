@@ -1,0 +1,9 @@
+create.mod Text::echo(char s).char {
+    return s;
+}
+
+create.mod Main::main() {
+    create.char t = "abc";
+    do.emit::t;
+    do.emit::Text::echo("def");
+}

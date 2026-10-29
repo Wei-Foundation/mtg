@@ -1,0 +1,15 @@
+create.mod Math::fact(int n).int {
+    if (n <= 1) {
+        return 1;
+    }
+    return n * Math::fact(n - 1);
+}
+
+create.mod Math::sum4(int a, int b, int c, int d).int {
+    return a + b + c + d;
+}
+
+create.mod Main::main() {
+    do.emit::Math::fact(6);
+    do.emit::Math::sum4(1, 2, 3, 4);
+}

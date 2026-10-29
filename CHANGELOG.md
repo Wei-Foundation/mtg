@@ -8,12 +8,14 @@
 
 - 子集自举冻结规格 `src/BOOTSTRAP.md`：语法、类型、运行时 ABI、PE/栈/堆布局、
   CLI 契约、固定上限与 10 天验收标准
-- `src/bootstrap.wei` stage1 CLI 骨架：`--version`、`build` 参数解析、源文件
-  读取、默认输出名、`-o`、`-std`、`-target` 与退出码
+- `src/bootstrap.wei` stage1 自举编译器：词法器、单遍解析/代码生成、x64 指令
+  发射、PE32+ 写出器、运行时桩（panic/alloc/free/read/write）与完整 CLI
 - `tests/bootstrap/`：`hello`、`arith`、`control`、`func`、`array`、`string`、
   `bytes`、`file`、`cmdline`、`exit` 共 10 个验收用例及 `run.ps1`
 - `tests/bootstrap/cli.ps1`：CLI 退出码、参数解析、默认输出名与
   `-RequireBuildSuccess` 完整构建检查
+- `tests/bootstrap/fixpoint.ps1` 与 `make bootstrap-fixpoint`：自动完成
+  stage0 → stage1 → stage2 → stage3 并比较 stage2/stage3 的 SHA256
 - stage0 新增 `__exit(code)` 内置函数（Windows x64，直接调用 `ExitProcess`）
 - stage0 新增 `GetCommandLineA` 导入（第 13 个 IAT 槽），供 `__command_line()`
   使用
@@ -26,6 +28,15 @@
 
 ### Fixed
 
+- stage1 的 `/`、`%` 除零检查原先测试被除数（RCX）而不是除数（RAX），
+  导致 `0 / 256`、`0 % 256` 被误判为除零；修正为 `test rax` 后再交换操作数，
+  `bootstrap2.exe` 不再在 `Mem::store64` 等路径 panic
+- stage0 `IfStmt` 在分支合并点未清除 `last_store_len_/last_store_slot_`，
+  分支未命中时会错误复用 RAX 中的旧值（表现为 `if (r != 0) { v = ... }`
+  在 r == 0 时返回 0）；两个退出点与合并点均清除缓存
+- stage1 解析器：局部名在 `Lex::next` 前保存、函数参数名正确消费、嵌套调用
+  前保存被调名、`if/else` 的 `j2` 先发射再回填条件跳转、数组初始化器按
+  “元素 0 在最低地址”布局写入
 - `__command_line()` 原先误接到 `VirtualAlloc`，恒返回 0；现返回真实 ANSI
   命令行
 - 入口桩在泄漏检查前用 ECX 保存 main 返回值，ECX 被格式串指针覆盖；现先写
@@ -35,6 +46,7 @@
 ### Changed
 
 - README 补充 Make 构建方式、社区文档链接与子集自举章节
+- README 完善文言文扫雷示例的玩法、规则、棋盘符号与示例局面
 - 清理已不存在的扫雷示例引用
 
 ## [0.02.74282] - 2026-10-26

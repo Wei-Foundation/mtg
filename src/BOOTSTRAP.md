@@ -8,11 +8,13 @@
 
 当前实现状态（2026-10-28）：
 
-- 规格、10 个验收用例与运行器已完成，stage0 下 10/10 通过；
-- `src/bootstrap.wei` 的 CLI 骨架已可被 stage0 编译，`--version`、参数解析、
-  源文件读取、`-o`、`-std`、`-target` 与退出码已按第 7 节工作；
-- `build` 目前读取源文件后以退出码 1 报
-  `frontend/codegen not implemented yet`，词法与代码生成从第 2 天开始接入。
+- 规格、10 个验收用例与运行器已完成；stage0、`bootstrap.exe`（stage1）与
+  `bootstrap2.exe`（stage2）下均为 10/10 通过；
+- `src/bootstrap.wei` 已包含完整的词法器、单遍解析/代码生成、x64 指令发射、
+  PE32+ 写出器、运行时桩与 CLI；
+- `bootstrap2.exe build src/bootstrap.wei -o bootstrap3.exe` 成功，
+  `SHA256(bootstrap2.exe) == SHA256(bootstrap3.exe)`，fixpoint 已达成；
+- CLI 契约检查 21/21 通过（含 `-RequireBuildSuccess` 重建 `bootstrap.wei`）。
 
 ---
 

@@ -1,0 +1,111 @@
+create.mod Cmd::line().omni {
+    return __command_line();
+}
+
+create.mod Cmd::argc().int {
+    create.ptr.int p = Cmd::line();
+    create.int i = 0;
+    create.int count = 0;
+    create.int inq = 0;
+    create.int inarg = 0;
+    create.int c = __byte_at(p, 0);
+    while (c != 0) {
+        if (inq == 1) {
+            if (c == 34) {
+                inq = 0;
+            }
+            inarg = 1;
+        } else {
+            if (c == 34) {
+                inq = 1;
+                inarg = 1;
+            } else {
+                if (c == 32) {
+                    if (inarg == 1) {
+                        count = count + 1;
+                        inarg = 0;
+                    }
+                } else {
+                    inarg = 1;
+                }
+            }
+        }
+        i = i + 1;
+        c = __byte_at(p, i);
+    }
+    if (inarg == 1) {
+        count = count + 1;
+    }
+    return count;
+}
+
+create.mod Cmd::arg(int index, char out, int max).int {
+    create.ptr.int p = Cmd::line();
+    create.int i = 0;
+    create.int arg = 0;
+    create.int n = 0;
+    create.int inq = 0;
+    create.int started = 0;
+    create.int c = __byte_at(p, 0);
+    while (c != 0) {
+        if (inq == 1) {
+            if (c == 34) {
+                inq = 0;
+            } else {
+                if (arg == index && n < max - 1) {
+                    __store_byte(out, n, c);
+                    n = n + 1;
+                }
+            }
+        } else {
+            if (c == 34) {
+                inq = 1;
+                started = 1;
+            } else {
+                if (c == 32) {
+                    if (started == 1) {
+                        if (arg == index) {
+                            __store_byte(out, n, 0);
+                            return n;
+                        }
+                        arg = arg + 1;
+                        n = 0;
+                        started = 0;
+                    }
+                } else {
+                    started = 1;
+                    if (arg == index && n < max - 1) {
+                        __store_byte(out, n, c);
+                        n = n + 1;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+        c = __byte_at(p, i);
+    }
+    if (started == 1 && arg == index) {
+        __store_byte(out, n, 0);
+        return n;
+    }
+    __store_byte(out, 0, 0);
+    return 0;
+}
+
+create.mod Buf::alloc(int n).omni {
+    return __rt_alloc(n);
+}
+
+create.mod Cast::str(omni x).omni {
+    return x;
+}
+
+create.mod Main::main() {
+    create.int argc = Cmd::argc();
+    create.ptr.int raw = Buf::alloc(256);
+    create.char a1 = Cast::str(raw);
+    Cmd::arg(1, a1, 256);
+    do.emit::argc;
+    do.emit::a1;
+    __rt_free(raw);
+}

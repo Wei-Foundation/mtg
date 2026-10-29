@@ -20,7 +20,7 @@ ERRNULL := 2>/dev/null
 RUN     := ./$(TARGET)
 endif
 
-.PHONY: all check bootstrap-check clean
+.PHONY: all check bootstrap-check bootstrap-fixpoint clean
 
 all: $(TARGET)
 
@@ -33,6 +33,10 @@ check: $(TARGET)
 # Windows only: run the 10 bootstrap subset acceptance programs with stage0.
 bootstrap-check: $(TARGET)
 	powershell -NoProfile -ExecutionPolicy Bypass -File tests/bootstrap/run.ps1
+
+# Windows only: stage0 -> stage1 -> stage2 -> stage3, require stage2 == stage3.
+bootstrap-fixpoint: $(TARGET)
+	powershell -NoProfile -ExecutionPolicy Bypass -File tests/bootstrap/fixpoint.ps1
 
 clean:
 	-@$(RM) mtg $(ERRNULL)

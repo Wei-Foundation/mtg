@@ -1,0 +1,19 @@
+create.mod Main::main() {
+    create.int i = 0;
+    create.int s = 0;
+    while (i < 5) {
+        if (i == 3) {
+            s = s + 100;
+        } else {
+            s = s + i;
+        }
+        i = i + 1;
+    }
+    do.emit::s;
+    do.emit::i;
+    if (s > 50 && i == 5) {
+        do.emit::"ok";
+    } else {
+        do.emit::"bad";
+    }
+}

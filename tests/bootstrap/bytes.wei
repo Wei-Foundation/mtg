@@ -1,0 +1,12 @@
+create.mod Mem::alloc(int n).omni {
+    return __rt_alloc(n);
+}
+
+create.mod Main::main() {
+    create.ptr.int p = Mem::alloc(16);
+    __store_byte(p, 0, 65);
+    __store_byte(p, 1, 66);
+    do.emit::__byte_at(p, 0);
+    do.emit::__byte_at(p, 1);
+    __rt_free(p);
+}

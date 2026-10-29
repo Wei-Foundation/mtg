@@ -321,10 +321,10 @@ create.mod Path::outName(char src, char out, int max).int {
 //   0 EOF, 1 ERROR, 2 IDENT, 3 INT, 4 STRING
 //   10 create, 11 mod, 12 int, 13 char, 14 ptr, 15 omni,
 //   16 if, 17 else, 18 while, 19 return, 20 true, 21 false,
-//   22 do, 23 emit
+//   22 do, 23 emit, 24 break, 25 continue, 26 for, 27 loop, 28 repeat
 //   30 ::, 31 ., 32 {, 33 }, 34 (, 35 ), 36 [, 37 ], 38 ,, 39 ;
 //   40 =, 41 ==, 42 !=, 43 <, 44 >, 45 <=, 46 >=,
-//   47 +, 48 -, 49 *, 50 /, 51 %, 52 !, 53 &&, 54 ||
+//   47 +, 48 -, 49 *, 50 /, 51 %, 52 !, 53 &&, 54 ||, 55 ++, 56 --
 //
 // Context layout (byte offsets):
 //   0 srcPtr, 8 srcLen, 16 pos, 24 line, 32 col
@@ -498,6 +498,9 @@ create.mod Lex::keyword(ptr.int ctx, int start, int len).int {
         if (Src::eq(ctx, start, 3, "ptr") == 1) {
             return 14;
         }
+        if (Src::eq(ctx, start, 3, "for") == 1) {
+            return 26;
+        }
         return 2;
     }
     if (len == 4) {
@@ -516,6 +519,9 @@ create.mod Lex::keyword(ptr.int ctx, int start, int len).int {
         if (Src::eq(ctx, start, 4, "emit") == 1) {
             return 23;
         }
+        if (Src::eq(ctx, start, 4, "loop") == 1) {
+            return 27;
+        }
         return 2;
     }
     if (len == 5) {
@@ -525,6 +531,9 @@ create.mod Lex::keyword(ptr.int ctx, int start, int len).int {
         if (Src::eq(ctx, start, 5, "false") == 1) {
             return 21;
         }
+        if (Src::eq(ctx, start, 5, "break") == 1) {
+            return 24;
+        }
         return 2;
     }
     if (len == 6) {
@@ -533,6 +542,15 @@ create.mod Lex::keyword(ptr.int ctx, int start, int len).int {
         }
         if (Src::eq(ctx, start, 6, "return") == 1) {
             return 19;
+        }
+        if (Src::eq(ctx, start, 6, "repeat") == 1) {
+            return 28;
+        }
+        return 2;
+    }
+    if (len == 8) {
+        if (Src::eq(ctx, start, 8, "continue") == 1) {
+            return 25;
         }
         return 2;
     }
@@ -747,10 +765,20 @@ create.mod Lex::scanPunct(ptr.int ctx, int base, int c).int {
                                                             }
                                                         } else {
                                                             if (c == 43) {
-                                                                k = 47;
+                                                                if (n == 43) {
+                                                                    k = 55;
+                                                                    len = 2;
+                                                                } else {
+                                                                    k = 47;
+                                                                }
                                                             } else {
                                                                 if (c == 45) {
-                                                                    k = 48;
+                                                                    if (n == 45) {
+                                                                        k = 56;
+                                                                        len = 2;
+                                                                    } else {
+                                                                        k = 48;
+                                                                    }
                                                                 } else {
                                                                     if (c == 42) {
                                                                         k = 49;
@@ -880,7 +908,6 @@ create.mod Data::init(ptr.int ctx, ptr.int data, int cap) {
     Ctx::set(ctx, 208, Cast::num(data));
     Ctx::set(ctx, 216, cap);
     Ctx::set(ctx, 224, 544);
-    do.emit::"DBG d1";
     __store_byte(data, 512, 37);
     __store_byte(data, 513, 108);
     __store_byte(data, 514, 108);
@@ -891,18 +918,14 @@ create.mod Data::init(ptr.int ctx, ptr.int data, int cap) {
     __store_byte(data, 529, 115);
     __store_byte(data, 530, 10);
     __store_byte(data, 531, 0);
-    do.emit::"DBG d2";
     create.int p = 544;
     Ctx::set(ctx, 536, p);
     p = Data::putRaw(data, p, "runtime panic: division by zero");
-    do.emit::"DBG d3";
     Ctx::set(ctx, 544, p);
     p = Data::putRaw(data, p, "runtime panic: array index out of bounds");
-    do.emit::"DBG d4";
     Ctx::set(ctx, 552, p);
     p = Data::putRaw(data, p, "runtime panic: heap exhausted");
     Ctx::set(ctx, 224, p);
-    do.emit::"DBG d5";
 }
 
 // ── Code buffer and fixups ──────────────────────────────────────────────────
@@ -1745,22 +1768,12 @@ create.mod Pe::headers(ptr.int ctx, ptr.int out, int dataRva, int heapOff) {
 }
 
 create.mod Pe::build(ptr.int ctx, ptr.int out, int cap, int mainPos).int {
-    do.emit::"DBG pe begin";
     create.int codeSize = Ctx::get(ctx, 200);
-    do.emit::"DBG codeSize";
-    do.emit::codeSize;
     create.int heapOff = Num::alignUp(Ctx::get(ctx, 224), 16);
-    do.emit::"DBG heapOff";
-    do.emit::heapOff;
     create.int textRaw = Num::alignUp(codeSize, 512);
     create.int dataRva = Num::alignUp(4096 + codeSize, 4096);
     create.int dataRaw = Num::alignUp(heapOff, 512);
     create.int total = 512 + textRaw + dataRaw;
-    do.emit::"DBG sizes";
-    do.emit::textRaw;
-    do.emit::dataRva;
-    do.emit::dataRaw;
-    do.emit::total;
     if (total > cap) {
         return 0;
     }
@@ -2095,14 +2108,15 @@ create.mod Loc::addParamAt(ptr.int ctx, int ty, int index, int nameBase).int {
     return n;
 }
 
-// ── Block stack (40-byte frames) ────────────────────────────────────────────
-//   0 kind, 8 savedLocalCount, 16 jump1, 24 jump2, 32 loopStart
+// ── Block stack (64-byte frames) ────────────────────────────────────────────
+//   0 kind, 8 savedLocalCount, 16 jump1, 24 jump2, 32 loopStart,
+//   40 aux1, 48 aux2, 56 aux3
 create.mod Blk::get(ptr.int ctx, int depth, int field).int {
-    return Ctx::get(ctx, 1024 + depth * 40 + field);
+    return Ctx::get(ctx, 1024 + depth * 64 + field);
 }
 
 create.mod Blk::set(ptr.int ctx, int depth, int field, int value) {
-    Ctx::set(ctx, 1024 + depth * 40 + field, value);
+    Ctx::set(ctx, 1024 + depth * 64 + field, value);
 }
 
 create.mod Parse::push(ptr.int ctx, int kind, int jump1, int loopStart).int {
@@ -2115,6 +2129,9 @@ create.mod Parse::push(ptr.int ctx, int kind, int jump1, int loopStart).int {
     Blk::set(ctx, depth, 16, jump1);
     Blk::set(ctx, depth, 24, 0);
     Blk::set(ctx, depth, 32, loopStart);
+    Blk::set(ctx, depth, 40, 0);
+    Blk::set(ctx, depth, 48, 0);
+    Blk::set(ctx, depth, 56, Ctx::get(ctx, 280));
     Ctx::set(ctx, 520, depth + 1);
     return 1;
 }
@@ -2316,6 +2333,17 @@ create.mod Expr::parse(ptr.int ctx, int minPrec).int {
                                             Ctx::set(ctx, 512, ty);
                                         }
                                         Lex::next(ctx);
+                                        if (arrLen == 0 && Ctx::get(ctx, 72) == 55) {
+                                            Code::addRaxImm8(ctx, 1);
+                                            Code::movSlotReg(ctx, slot, 0);
+                                            Lex::next(ctx);
+                                        } else {
+                                            if (arrLen == 0 && Ctx::get(ctx, 72) == 56) {
+                                                Code::addRaxImm8(ctx, 255);
+                                                Code::movSlotReg(ctx, slot, 0);
+                                                Lex::next(ctx);
+                                            }
+                                        }
                                         if (Ctx::get(ctx, 72) == 36) {
                                             if (arrLen <= 0) { return Parse::fail(ctx, 32); }
                                             Lex::next(ctx);
@@ -2445,7 +2473,7 @@ create.mod Expr::parse(ptr.int ctx, int minPrec).int {
                         Ctx::set(ctx, 512, 0);
                     } else {
                         if (k == 50 || k == 51) {
-                            Code::testRcx(ctx);
+                            Code::testRax(ctx);
                             Code::jccTo(ctx, 4, Ctx::get(ctx, 456));
                             Code::movRegReg(ctx, 2, 0);
                             Code::movRegReg(ctx, 0, 1);
@@ -2617,13 +2645,18 @@ create.mod Parse::ifStmt(ptr.int ctx).int {
 create.mod Parse::whileStmt(ptr.int ctx).int {
     Lex::next(ctx);
     if (Parse::expect(ctx, 34, 6) == 0) { return 0; }
+    create.int skip = Code::jmp(ctx);
+    create.int brk = Code::jmp(ctx);
     create.int start = Code::pos(ctx);
+    Code::patchRel(ctx, skip, start);
     if (Expr::parse(ctx, 1) == 0) { return 0; }
     if (Parse::expect(ctx, 35, 7) == 0) { return 0; }
     Code::testRax(ctx);
     create.int j = Code::jcc(ctx, 4);
     if (Parse::expect(ctx, 32, 8) == 0) { return 0; }
-    return Parse::push(ctx, 3, j, start);
+    if (Parse::push(ctx, 3, j, start) == 0) { return 0; }
+    Blk::set(ctx, Ctx::get(ctx, 520) - 1, 24, brk - 1);
+    return 1;
 }
 
 create.mod Parse::identStmt(ptr.int ctx).int {
@@ -2634,6 +2667,18 @@ create.mod Parse::identStmt(ptr.int ctx).int {
         create.int slot = Loc::get(ctx, idx, 16);
         create.int arrLen = Loc::get(ctx, idx, 24);
         create.int ty = Loc::get(ctx, idx, 32);
+        if (Ctx::get(ctx, 72) == 55 || Ctx::get(ctx, 72) == 56) {
+            if (arrLen > 0) { return Parse::fail(ctx, 25); }
+            Code::movRegSlot(ctx, 0, slot);
+            if (Ctx::get(ctx, 72) == 55) {
+                Code::addRaxImm8(ctx, 1);
+            } else {
+                Code::addRaxImm8(ctx, 255);
+            }
+            Code::movSlotReg(ctx, slot, 0);
+            Lex::next(ctx);
+            return Parse::expect(ctx, 39, 10);
+        }
         if (Ctx::get(ctx, 72) == 40) {
             if (arrLen > 0) { return Parse::fail(ctx, 25); }
             Lex::next(ctx);
@@ -2721,6 +2766,189 @@ create.mod Parse::identStmt(ptr.int ctx).int {
     return Parse::expect(ctx, 39, 10);
 }
 
+create.mod Parse::stepExpr(ptr.int ctx).int {
+    if (Ctx::get(ctx, 72) == 2) {
+        create.int idx = Loc::findCur(ctx);
+        if (idx >= 0) {
+            create.int slot = Loc::get(ctx, idx, 16);
+            create.int arrLen = Loc::get(ctx, idx, 24);
+            create.int ty = Loc::get(ctx, idx, 32);
+            create.int next = Ctx::get(ctx, 128);
+            if (arrLen == 0 && (next == 55 || next == 56)) {
+                create.int op = next;
+                Lex::next(ctx);
+                Lex::next(ctx);
+                Code::movRegSlot(ctx, 0, slot);
+                if (op == 55) {
+                    Code::addRaxImm8(ctx, 1);
+                } else {
+                    Code::addRaxImm8(ctx, 255);
+                }
+                Code::movSlotReg(ctx, slot, 0);
+                Ctx::set(ctx, 512, 0);
+                return 1;
+            }
+            if (arrLen == 0 && next == 40) {
+                Lex::next(ctx);
+                Lex::next(ctx);
+                if (Expr::parse(ctx, 1) == 0) { return 0; }
+                if (Ty::compat(ty, Ctx::get(ctx, 512)) == 0) { return Parse::fail(ctx, 26); }
+                Code::movSlotReg(ctx, slot, 0);
+                return 1;
+            }
+        }
+    }
+    return Expr::parse(ctx, 1);
+}
+
+create.mod Parse::forStmt(ptr.int ctx).int {
+    Lex::next(ctx);
+    create.int hasParen = 0;
+    if (Ctx::get(ctx, 72) == 34) {
+        hasParen = 1;
+        Lex::next(ctx);
+    }
+    create.int savedLocals = Ctx::get(ctx, 256);
+    create.int savedTop = Ctx::get(ctx, 280);
+    if (Ctx::get(ctx, 72) == 39) {
+        Lex::next(ctx);
+    } else {
+        if (Ctx::get(ctx, 72) == 10) {
+            if (Parse::var(ctx) == 0) { return 0; }
+        } else {
+            if (Ctx::get(ctx, 72) == 43 && Ctx::get(ctx, 128) == 2) {
+                Lex::next(ctx);
+                Ident::saveTo(ctx, 560);
+                Lex::next(ctx);
+                create.int idx = Loc::addAt(ctx, 0, 0, 560);
+                if (idx < 0) { return 0; }
+                create.int slot = Loc::get(ctx, idx, 16);
+                if (Ctx::get(ctx, 72) == 40) {
+                    Lex::next(ctx);
+                    if (Expr::parse(ctx, 5) == 0) { return 0; }
+                    if (Ctx::get(ctx, 512) != 0) { return Parse::fail(ctx, 26); }
+                    Code::movSlotReg(ctx, slot, 0);
+                } else {
+                    Code::movSlotImm(ctx, slot, 1);
+                }
+                if (Parse::expect(ctx, 44, 7) == 0) { return 0; }
+                if (Parse::expect(ctx, 39, 10) == 0) { return 0; }
+            } else {
+                if (Ctx::get(ctx, 72) == 2) {
+                    if (Parse::identStmt(ctx) == 0) { return 0; }
+                } else {
+                    return Parse::fail(ctx, 12);
+                }
+            }
+        }
+    }
+    create.int start = Code::pos(ctx);
+    create.int j = 0;
+    if (Ctx::get(ctx, 72) != 39) {
+        if (Expr::parse(ctx, 1) == 0) { return 0; }
+        Code::testRax(ctx);
+        j = Code::jcc(ctx, 4);
+    }
+    if (Parse::expect(ctx, 39, 10) == 0) { return 0; }
+    create.int skip = Code::jmp(ctx);
+    create.int cont = Code::pos(ctx);
+    if (Ctx::get(ctx, 72) != 35 && Ctx::get(ctx, 72) != 32) {
+        if (Parse::stepExpr(ctx) == 0) { return 0; }
+    }
+    Code::jmpTo(ctx, start);
+    create.int brk = Code::jmp(ctx);
+    Code::patchRel(ctx, skip, Code::pos(ctx));
+    if (hasParen == 1) {
+        if (Parse::expect(ctx, 35, 7) == 0) { return 0; }
+    }
+    if (Parse::expect(ctx, 32, 8) == 0) { return 0; }
+    if (Parse::push(ctx, 7, j, cont) == 0) { return 0; }
+    create.int d = Ctx::get(ctx, 520) - 1;
+    Blk::set(ctx, d, 8, savedLocals);
+    Blk::set(ctx, d, 24, brk - 1);
+    Blk::set(ctx, d, 56, savedTop);
+    return 1;
+}
+
+create.mod Parse::loopStmt(ptr.int ctx).int {
+    Lex::next(ctx);
+    create.int count = 0;
+    create.int hasCount = 0;
+    if (Ctx::get(ctx, 72) == 34) {
+        Lex::next(ctx);
+        if (Ctx::get(ctx, 72) == 3) {
+            count = Ctx::get(ctx, 96);
+            hasCount = 1;
+            Lex::next(ctx);
+        }
+        if (Parse::expect(ctx, 35, 7) == 0) { return 0; }
+    }
+    create.int savedLocals = Ctx::get(ctx, 256);
+    create.int savedTop = Ctx::get(ctx, 280);
+    create.int counter = 0;
+    if (hasCount == 1) {
+        counter = 68 + Ctx::get(ctx, 280);
+        Ctx::set(ctx, 280, Ctx::get(ctx, 280) + 1);
+        Code::movSlotImm(ctx, counter, count);
+    }
+    create.int skip = Code::jmp(ctx);
+    create.int cont = 0;
+    if (hasCount == 1) {
+        cont = Code::jmp(ctx);
+    }
+    create.int brk = Code::jmp(ctx);
+    create.int start = Code::pos(ctx);
+    Code::patchRel(ctx, skip, start);
+    create.int j = 0;
+    if (hasCount == 1) {
+        Code::movRegSlot(ctx, 0, counter);
+        Code::testRax(ctx);
+        j = Code::jcc(ctx, 14);
+    }
+    if (Parse::expect(ctx, 32, 8) == 0) { return 0; }
+    create.int kind = 9;
+    if (hasCount == 1) { kind = 8; }
+    if (Parse::push(ctx, kind, j, start) == 0) { return 0; }
+    create.int d = Ctx::get(ctx, 520) - 1;
+    Blk::set(ctx, d, 8, savedLocals);
+    Blk::set(ctx, d, 24, brk - 1);
+    Blk::set(ctx, d, 56, savedTop);
+    if (hasCount == 1) {
+        Blk::set(ctx, d, 32, cont - 1);
+        Blk::set(ctx, d, 40, start);
+        Blk::set(ctx, d, 48, counter);
+    }
+    return 1;
+}
+
+create.mod Parse::loopDepth(ptr.int ctx).int {
+    create.int d = Ctx::get(ctx, 520) - 1;
+    while (d >= 0) {
+        create.int k = Blk::get(ctx, d, 0);
+        if (k == 3 || k == 7 || k == 8 || k == 9) {
+            return d;
+        }
+        d = d - 1;
+    }
+    return 0 - 1;
+}
+
+create.mod Parse::breakStmt(ptr.int ctx).int {
+    Lex::next(ctx);
+    create.int d = Parse::loopDepth(ctx);
+    if (d < 0) { return Parse::fail(ctx, 12); }
+    Code::jmpTo(ctx, Blk::get(ctx, d, 24));
+    return Parse::expect(ctx, 39, 10);
+}
+
+create.mod Parse::continueStmt(ptr.int ctx).int {
+    Lex::next(ctx);
+    create.int d = Parse::loopDepth(ctx);
+    if (d < 0) { return Parse::fail(ctx, 12); }
+    Code::jmpTo(ctx, Blk::get(ctx, d, 32));
+    return Parse::expect(ctx, 39, 10);
+}
+
 create.mod Parse::stmt(ptr.int ctx).int {
     create.int k = Ctx::get(ctx, 72);
     if (k == 10) { return Parse::var(ctx); }
@@ -2728,12 +2956,88 @@ create.mod Parse::stmt(ptr.int ctx).int {
     if (k == 19) { return Parse::ret(ctx); }
     if (k == 16) { return Parse::ifStmt(ctx); }
     if (k == 18) { return Parse::whileStmt(ctx); }
+    if (k == 26) { return Parse::forStmt(ctx); }
+    if (k == 27 || k == 28) { return Parse::loopStmt(ctx); }
+    if (k == 24) { return Parse::breakStmt(ctx); }
+    if (k == 25) { return Parse::continueStmt(ctx); }
     if (k == 32) {
         Lex::next(ctx);
         return Parse::push(ctx, 4, 0, 0);
     }
     if (k == 2) { return Parse::identStmt(ctx); }
     return Parse::fail(ctx, 12);
+}
+
+create.mod Parse::closeFn(ptr.int ctx, int depth, int saved).int {
+    Lex::next(ctx);
+    Code::movImm64(ctx, 0, 0);
+    Code::movRspRbp(ctx);
+    Code::popRbp(ctx);
+    Code::ret(ctx);
+    create.int fs = Num::alignUp(8 * (68 + Ctx::get(ctx, 280)) + 32, 16);
+    Code::patch32(ctx, Ctx::get(ctx, 288), fs);
+    Ctx::set(ctx, 256, saved);
+    Ctx::set(ctx, 520, depth);
+    return 1;
+}
+
+create.mod Parse::closeIf(ptr.int ctx, int depth, int kind, int saved).int {
+    Lex::next(ctx);
+    Ctx::set(ctx, 256, saved);
+    Ctx::set(ctx, 520, depth);
+    if (kind == 1) {
+        if (Ctx::get(ctx, 72) == 17) {
+            Lex::next(ctx);
+            create.int j2 = Code::jmp(ctx);
+            Code::patchRel(ctx, Blk::get(ctx, depth, 16), Code::pos(ctx));
+            if (Parse::expect(ctx, 32, 8) == 0) { return 0; }
+            if (Parse::push(ctx, 2, j2, 0) == 0) { return 0; }
+        } else {
+            Code::patchRel(ctx, Blk::get(ctx, depth, 16), Code::pos(ctx));
+        }
+        return 1;
+    }
+    Code::patchRel(ctx, Blk::get(ctx, depth, 16), Code::pos(ctx));
+    return 1;
+}
+
+create.mod Parse::closeLoop(ptr.int ctx, int depth, int kind, int saved).int {
+    Lex::next(ctx);
+    if (kind == 3 || kind == 7) {
+        Code::jmpTo(ctx, Blk::get(ctx, depth, 32));
+        create.int end = Code::pos(ctx);
+        if (Blk::get(ctx, depth, 16) != 0) {
+            Code::patchRel(ctx, Blk::get(ctx, depth, 16), end);
+        }
+        Code::patchRel(ctx, Blk::get(ctx, depth, 24) + 1, end);
+    } else {
+        if (kind == 8) {
+            create.int decPos = Code::pos(ctx);
+            Code::patchRel(ctx, Blk::get(ctx, depth, 32) + 1, decPos);
+            create.int counter = Blk::get(ctx, depth, 48);
+            Code::movRegSlot(ctx, 0, counter);
+            Code::addRaxImm8(ctx, 255);
+            Code::movSlotReg(ctx, counter, 0);
+            Code::jmpTo(ctx, Blk::get(ctx, depth, 40));
+            create.int end = Code::pos(ctx);
+            Code::patchRel(ctx, Blk::get(ctx, depth, 16), end);
+            Code::patchRel(ctx, Blk::get(ctx, depth, 24) + 1, end);
+        } else {
+            if (kind == 9) {
+                Code::jmpTo(ctx, Blk::get(ctx, depth, 32));
+                create.int end = Code::pos(ctx);
+                Code::patchRel(ctx, Blk::get(ctx, depth, 24) + 1, end);
+            } else {
+                Ctx::set(ctx, 256, saved);
+                Ctx::set(ctx, 520, depth);
+                return 1;
+            }
+        }
+    }
+    Ctx::set(ctx, 256, saved);
+    Ctx::set(ctx, 280, Blk::get(ctx, depth, 56));
+    Ctx::set(ctx, 520, depth);
+    return 1;
 }
 
 create.mod Parse::body(ptr.int ctx, int fnIdx).int {
@@ -2748,48 +3052,17 @@ create.mod Parse::body(ptr.int ctx, int fnIdx).int {
             create.int kind = Blk::get(ctx, depth, 0);
             create.int saved = Blk::get(ctx, depth, 8);
             if (kind == 0) {
-                Lex::next(ctx);
-                Code::movImm64(ctx, 0, 0);
-                Code::movRspRbp(ctx);
-                Code::popRbp(ctx);
-                Code::ret(ctx);
-                create.int fs = Num::alignUp(8 * (68 + Ctx::get(ctx, 280)) + 32, 16);
-                Code::patch32(ctx, Ctx::get(ctx, 288), fs);
-                Ctx::set(ctx, 256, saved);
-                Ctx::set(ctx, 520, depth);
-                return 1;
+                return Parse::closeFn(ctx, depth, saved);
             }
-            if (kind == 1) {
-                Lex::next(ctx);
-                Ctx::set(ctx, 256, saved);
-                Ctx::set(ctx, 520, depth);
-                if (Ctx::get(ctx, 72) == 17) {
-                    Lex::next(ctx);
-                    create.int j2 = Code::jmp(ctx);
-                    Code::patchRel(ctx, Blk::get(ctx, depth, 16), Code::pos(ctx));
-                    if (Parse::expect(ctx, 32, 8) == 0) { return 0; }
-                    if (Parse::push(ctx, 2, j2, 0) == 0) { return 0; }
-                } else {
-                    Code::patchRel(ctx, Blk::get(ctx, depth, 16), Code::pos(ctx));
-                }
+            if (kind == 1 || kind == 2) {
+                if (Parse::closeIf(ctx, depth, kind, saved) == 0) { return 0; }
             } else {
-                if (kind == 2) {
+                if (kind == 3 || kind == 7 || kind == 8 || kind == 9) {
+                    if (Parse::closeLoop(ctx, depth, kind, saved) == 0) { return 0; }
+                } else {
                     Lex::next(ctx);
-                    Code::patchRel(ctx, Blk::get(ctx, depth, 16), Code::pos(ctx));
                     Ctx::set(ctx, 256, saved);
                     Ctx::set(ctx, 520, depth);
-                } else {
-                    if (kind == 3) {
-                        Lex::next(ctx);
-                        Code::jmpTo(ctx, Blk::get(ctx, depth, 32));
-                        Code::patchRel(ctx, Blk::get(ctx, depth, 16), Code::pos(ctx));
-                        Ctx::set(ctx, 256, saved);
-                        Ctx::set(ctx, 520, depth);
-                    } else {
-                        Lex::next(ctx);
-                        Ctx::set(ctx, 256, saved);
-                        Ctx::set(ctx, 520, depth);
-                    }
                 }
             }
         } else {
@@ -2882,64 +3155,6 @@ create.mod Parse::program(ptr.int ctx).int {
     return 1;
 }
 
-create.mod Pe::selftest(ptr.int ctx, char outPath).int {
-    Ctx::set(ctx, 432, Cast::num(outPath));
-    Code::seek(ctx, 64);
-    Code::pushRbp(ctx);
-    Code::movRbpRsp(ctx);
-    Code::subRspImm(ctx, 32);
-    create.int p = Code::leaRip(ctx, 1);
-    Fix::addData(ctx, p, 528);
-    p = Code::leaRip(ctx, 2);
-    Fix::addData(ctx, p, 544);
-    Code::xorEax(ctx);
-    Code::callIat(ctx, 0);
-    Code::movRspRbp(ctx);
-    Code::popRbp(ctx);
-    Code::ret(ctx);
-    create.ptr.int data = Cast::toPtr(Ctx::get(ctx, 208));
-    create.char msg = "Hello, bootstrap!";
-    create.int i = 0;
-    while (__byte_at(msg, i) != 0) {
-        __store_byte(data, 544 + i, __byte_at(msg, i));
-        i = i + 1;
-    }
-    __store_byte(data, 544 + i, 0);
-    Ctx::set(ctx, 224, 544 + i + 1);
-    create.ptr.int out = Cast::toPtr(Ctx::get(ctx, 440));
-    return Pe::build(ctx, out, Ctx::get(ctx, 448), 64);
-}
-
-// Non-zero arity on purpose: stage0 auto-invokes every zero-arg mod member
-// at startup (see src/BOOTSTRAP.md section 6.6).
-create.mod Pe::runSelfTest(int mode).int {
-    create.ptr.int ctxRaw = Mem::alloc(131072);
-    create.ptr.int ctx = ctxRaw;
-    create.ptr.int dataRaw = Mem::alloc(1048576);
-    create.ptr.int data = dataRaw;
-    create.ptr.int codeRaw = Mem::alloc(4194304);
-    create.ptr.int code = codeRaw;
-    create.ptr.int outRaw = Mem::alloc(8388608);
-    create.ptr.int out = outRaw;
-    create.ptr.int fixRaw = Mem::alloc(1048576);
-    create.ptr.int fix = fixRaw;
-    create.ptr.int iatRaw = Mem::alloc(1048576);
-    create.ptr.int iat = iatRaw;
-    Data::init(ctx, data, 1048576);
-    Code::init(ctx, code, 4194304);
-    Fix::init(ctx, fix, iat);
-    Ctx::set(ctx, 440, Cast::num(out));
-    Ctx::set(ctx, 448, 8388608);
-    create.int wrote = Pe::selftest(ctx, "pe-selftest.exe");
-    Mem::free(iatRaw);
-    Mem::free(fixRaw);
-    Mem::free(outRaw);
-    Mem::free(codeRaw);
-    Mem::free(dataRaw);
-    Mem::free(ctxRaw);
-    return wrote;
-}
-
 // Keep this as a direct-return helper: stage0 miscompiles a loop-carried
 // boolean flag in large functions (see src/BOOTSTRAP.md section 6.1).
 create.mod Cli::stdOk(char opt).int {
@@ -2999,17 +3214,6 @@ create.mod Main::main() {
     }
 
     Cmd::arg(1, a1, 64);
-    if (Str::eq(a1, "selftest-pe") == 1) {
-        create.int wrote = Pe::runSelfTest(0);
-        do.emit::"pe selftest bytes";
-        do.emit::wrote;
-        if (wrote == 0) {
-            __exit(1);
-            return;
-        }
-        __exit(0);
-        return;
-    }
     if (Str::eq(a1, "version") == 1 || Str::eq(a1, "-v") == 1 || Str::eq(a1, "--version") == 1) {
         do.emit::"Module Target Generator 0.02.74282 - bootstrap stage1 (win64)";
         Mem::free(rawA1);
@@ -3141,39 +3345,27 @@ create.mod Main::main() {
         return;
     }
     __store_byte(src, n, 0);
-    do.emit::"DBG read ok";
 
     create.ptr.int ctxRaw = Mem::alloc(131072);
-    do.emit::"DBG a1";
     create.ptr.int ctx = ctxRaw;
     create.ptr.int dataRaw = Mem::alloc(1048576);
-    do.emit::"DBG a2";
     create.ptr.int data = dataRaw;
     create.ptr.int codeRaw = Mem::alloc(4194304);
-    do.emit::"DBG a3";
     create.ptr.int code = codeRaw;
     create.ptr.int outRaw = Mem::alloc(8388608);
-    do.emit::"DBG a4";
     create.ptr.int outBuf = outRaw;
     create.ptr.int fixRaw = Mem::alloc(1048576);
-    do.emit::"DBG a5";
     create.ptr.int fix = fixRaw;
     create.ptr.int iatRaw = Mem::alloc(1048576);
-    do.emit::"DBG a6";
     create.ptr.int iat = iatRaw;
     create.ptr.int funcRaw = Mem::alloc(65536);
-    do.emit::"DBG a7";
     create.ptr.int funcs = funcRaw;
     create.ptr.int localRaw = Mem::alloc(65536);
-    do.emit::"DBG a8";
     create.ptr.int locals = localRaw;
 
     Data::init(ctx, data, 1048576);
-    do.emit::"DBG data";
     Code::init(ctx, code, 4194304);
-    do.emit::"DBG code";
     Fix::init(ctx, fix, iat);
-    do.emit::"DBG fix";
     Ctx::set(ctx, 232, Cast::num(funcs));
     Ctx::set(ctx, 240, 0);
     Ctx::set(ctx, 248, Cast::num(locals));
@@ -3196,9 +3388,7 @@ create.mod Main::main() {
     Ctx::set(ctx, 512, 0);
     Ctx::set(ctx, 520, 0);
     Rt::init(ctx);
-    do.emit::"DBG rt";
     Lex::init(ctx, src, n);
-    do.emit::"DBG lex";
     if (Ctx::get(ctx, 72) == 1) {
         Err::report(ctx, file);
         Mem::free(localRaw);
@@ -3217,7 +3407,6 @@ create.mod Main::main() {
         __exit(1);
         return;
     }
-    do.emit::"DBG parse begin";
     if (Parse::program(ctx) == 0) {
         Err::report(ctx, file);
         Mem::free(localRaw);
@@ -3236,9 +3425,7 @@ create.mod Main::main() {
         __exit(1);
         return;
     }
-    do.emit::"DBG parse ok";
     create.int wrote = Pe::build(ctx, outBuf, 8388608, Ctx::get(ctx, 528));
-    do.emit::"DBG pe ok";
     if (wrote == 0) {
         Msg::fileErr(file, "cannot write output file");
         Mem::free(localRaw);

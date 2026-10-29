@@ -1,0 +1,3 @@
+create.mod Main::main() {
+    do.emit::"Hello, bootstrap!";
+}

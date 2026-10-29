@@ -1,0 +1,12 @@
+create.mod Main::main() {
+    create.ptr.int p = __rt_alloc(16);
+    __store_byte(p, 0, 72);
+    __store_byte(p, 1, 105);
+    do.emit::__write_file("bootstrap-file.tmp", p, 2);
+    create.ptr.int q = __rt_alloc(16);
+    do.emit::__read_file("bootstrap-file.tmp", q, 16);
+    do.emit::__byte_at(q, 0);
+    do.emit::__byte_at(q, 1);
+    __rt_free(p);
+    __rt_free(q);
+}

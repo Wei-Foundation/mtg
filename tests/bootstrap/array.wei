@@ -1,0 +1,19 @@
+create.mod Buf::poke(ptr.int p, int off, int v).int {
+    __store_byte(p, off, v);
+    return __byte_at(p, off);
+}
+
+create.mod Main::main() {
+    create.int a[4] = {10, 20, 30, 40};
+    create.int s = 0;
+    create.int i = 0;
+    do.emit::a[0];
+    do.emit::a[3];
+    while (i < 4) {
+        s = s + a[i];
+        i = i + 1;
+    }
+    do.emit::s;
+    do.emit::Buf::poke(a, 0, 99);
+    do.emit::__byte_at(a, 0);
+}
