@@ -325,6 +325,9 @@ create.mod Path::outName(char src, char out, int max).int {
 //   30 ::, 31 ., 32 {, 33 }, 34 (, 35 ), 36 [, 37 ], 38 ,, 39 ;
 //   40 =, 41 ==, 42 !=, 43 <, 44 >, 45 <=, 46 >=,
 //   47 +, 48 -, 49 *, 50 /, 51 %, 52 !, 53 &&, 54 ||, 55 ++, 56 --
+//   57 :, 58 bool, 59 null, 60 sizeof, 61 cast, 62 new, 63 delete,
+//   64 match, 65 tuple, 66 recv, 67 part, 68 access, 69 adv, 70 struct,
+//   71 public, 72 private, 73 auto, 74 type
 //
 // Context layout (byte offsets):
 //   0 srcPtr, 8 srcLen, 16 pos, 24 line, 32 col
@@ -345,8 +348,12 @@ create.mod Path::outName(char src, char out, int max).int {
 //   480 rtAllocPos, 488 rtFreePos, 496 rtReadPos, 504 rtWritePos
 //   512 exprType, 520 blockDepth, 528 mainPos
 //   536 panicDivMsg, 544 panicOobMsg, 552 panicHeapMsg
-//   1024 block stack (64 frames x 40 bytes):
-//        kind, savedLocalCount, jump1, jump2, loopStart
+//   5504 partCount
+//   8192 part table (256 entries x 80 bytes):
+//        modOff, modLen, partOff, partLen, memberOff, memberLen,
+//        type, value, dataOff
+//   1024 block stack (64 frames x 64 bytes):
+//        kind, savedLocalCount, jump1, jump2, loopStart, aux1, aux2, aux3
 
 create.mod Lex::isAlpha(int c).int {
     if (c >= 65 && c <= 90) {
@@ -375,6 +382,32 @@ create.mod Lex::isIdent(int c).int {
     if (Lex::isDigit(c) == 1) {
         return 1;
     }
+    return 0;
+}
+
+// UTF-8 CJK: lead E4..E9, continuation 80..BF, codepoint in U+4E00..U+9FFF.
+create.mod Lex::isCjkLead(int c).int {
+    if (c >= 228 && c <= 233) {
+        return 1;
+    }
+    return 0;
+}
+
+create.mod Lex::isCjkCont(int c).int {
+    if (c >= 128 && c <= 191) {
+        return 1;
+    }
+    return 0;
+}
+
+create.mod Lex::cjkAt(ptr.int ctx, int p).int {
+    create.int a = Src::byte(ctx, p);
+    if (Lex::isCjkLead(a) == 0) { return 0; }
+    create.int b = Src::byte(ctx, p + 1);
+    create.int c = Src::byte(ctx, p + 2);
+    if (Lex::isCjkCont(b) == 0 || Lex::isCjkCont(c) == 0) { return 0; }
+    create.int cp = (a - 224) * 4096 + (b - 128) * 64 + (c - 128);
+    if (cp >= 19968 && cp <= 40959) { return 1; }
     return 0;
 }
 
@@ -480,78 +513,101 @@ create.mod Lex::skip(ptr.int ctx) {
 
 create.mod Lex::keyword(ptr.int ctx, int start, int len).int {
     if (len == 2) {
-        if (Src::eq(ctx, start, 2, "do") == 1) {
-            return 22;
-        }
-        if (Src::eq(ctx, start, 2, "if") == 1) {
-            return 16;
-        }
+        if (Src::eq(ctx, start, 2, "do") == 1) { return 22; }
+        if (Src::eq(ctx, start, 2, "if") == 1) { return 16; }
+        if (Src::eq(ctx, start, 2, "or") == 1) { return 54; }
+        if (Src::eq(ctx, start, 2, "in") == 1) { return 2; }
         return 2;
     }
     if (len == 3) {
-        if (Src::eq(ctx, start, 3, "mod") == 1) {
-            return 11;
-        }
-        if (Src::eq(ctx, start, 3, "int") == 1) {
-            return 12;
-        }
-        if (Src::eq(ctx, start, 3, "ptr") == 1) {
-            return 14;
-        }
-        if (Src::eq(ctx, start, 3, "for") == 1) {
-            return 26;
-        }
+        if (Src::eq(ctx, start, 3, "mod") == 1) { return 11; }
+        if (Src::eq(ctx, start, 3, "int") == 1) { return 12; }
+        if (Src::eq(ctx, start, 3, "ptr") == 1) { return 14; }
+        if (Src::eq(ctx, start, 3, "for") == 1) { return 26; }
+        if (Src::eq(ctx, start, 3, "new") == 1) { return 62; }
+        if (Src::eq(ctx, start, 3, "and") == 1) { return 53; }
+        if (Src::eq(ctx, start, 3, "not") == 1) { return 52; }
+        if (Src::eq(ctx, start, 3, "adv") == 1) { return 69; }
+        if (Src::eq(ctx, start, 3, "真") == 1) { return 20; }
+        if (Src::eq(ctx, start, 3, "假") == 1) { return 21; }
+        if (Src::eq(ctx, start, 3, "空") == 1) { return 59; }
+        if (Src::eq(ctx, start, 3, "与") == 1) { return 53; }
+        if (Src::eq(ctx, start, 3, "或") == 1) { return 54; }
+        if (Src::eq(ctx, start, 3, "非") == 1) { return 52; }
         return 2;
     }
     if (len == 4) {
-        if (Src::eq(ctx, start, 4, "char") == 1) {
-            return 13;
-        }
-        if (Src::eq(ctx, start, 4, "omni") == 1) {
-            return 15;
-        }
-        if (Src::eq(ctx, start, 4, "else") == 1) {
-            return 17;
-        }
-        if (Src::eq(ctx, start, 4, "true") == 1) {
-            return 20;
-        }
-        if (Src::eq(ctx, start, 4, "emit") == 1) {
-            return 23;
-        }
-        if (Src::eq(ctx, start, 4, "loop") == 1) {
-            return 27;
-        }
+        if (Src::eq(ctx, start, 4, "char") == 1) { return 13; }
+        if (Src::eq(ctx, start, 4, "omni") == 1) { return 15; }
+        if (Src::eq(ctx, start, 4, "else") == 1) { return 17; }
+        if (Src::eq(ctx, start, 4, "true") == 1) { return 20; }
+        if (Src::eq(ctx, start, 4, "emit") == 1) { return 23; }
+        if (Src::eq(ctx, start, 4, "loop") == 1) { return 27; }
+        if (Src::eq(ctx, start, 4, "bool") == 1) { return 58; }
+        if (Src::eq(ctx, start, 4, "null") == 1) { return 59; }
+        if (Src::eq(ctx, start, 4, "cast") == 1) { return 61; }
+        if (Src::eq(ctx, start, 4, "part") == 1) { return 67; }
+        if (Src::eq(ctx, start, 4, "auto") == 1) { return 73; }
+        if (Src::eq(ctx, start, 4, "type") == 1) { return 74; }
         return 2;
     }
     if (len == 5) {
-        if (Src::eq(ctx, start, 5, "while") == 1) {
-            return 18;
-        }
-        if (Src::eq(ctx, start, 5, "false") == 1) {
-            return 21;
-        }
-        if (Src::eq(ctx, start, 5, "break") == 1) {
-            return 24;
-        }
+        if (Src::eq(ctx, start, 5, "while") == 1) { return 18; }
+        if (Src::eq(ctx, start, 5, "false") == 1) { return 21; }
+        if (Src::eq(ctx, start, 5, "break") == 1) { return 24; }
+        if (Src::eq(ctx, start, 5, "match") == 1) { return 64; }
+        if (Src::eq(ctx, start, 5, "tuple") == 1) { return 65; }
+        if (Src::eq(ctx, start, 5, "recv") == 1) { return 66; }
         return 2;
     }
     if (len == 6) {
-        if (Src::eq(ctx, start, 6, "create") == 1) {
-            return 10;
-        }
-        if (Src::eq(ctx, start, 6, "return") == 1) {
-            return 19;
-        }
-        if (Src::eq(ctx, start, 6, "repeat") == 1) {
-            return 28;
-        }
+        if (Src::eq(ctx, start, 6, "create") == 1) { return 10; }
+        if (Src::eq(ctx, start, 6, "return") == 1) { return 19; }
+        if (Src::eq(ctx, start, 6, "repeat") == 1) { return 28; }
+        if (Src::eq(ctx, start, 6, "sizeof") == 1) { return 60; }
+        if (Src::eq(ctx, start, 6, "delete") == 1) { return 63; }
+        if (Src::eq(ctx, start, 6, "struct") == 1) { return 70; }
+        if (Src::eq(ctx, start, 6, "public") == 1) { return 71; }
+        if (Src::eq(ctx, start, 6, "access") == 1) { return 68; }
+        // 中文双字关键字（UTF-8 6 字节）
+        if (Src::eq(ctx, start, 6, "创建") == 1) { return 10; }
+        if (Src::eq(ctx, start, 6, "整型") == 1) { return 12; }
+        if (Src::eq(ctx, start, 6, "布尔") == 1) { return 58; }
+        if (Src::eq(ctx, start, 6, "文本") == 1) { return 13; }
+        if (Src::eq(ctx, start, 6, "万能") == 1) { return 15; }
+        if (Src::eq(ctx, start, 6, "指针") == 1) { return 14; }
+        if (Src::eq(ctx, start, 6, "如果") == 1) { return 16; }
+        if (Src::eq(ctx, start, 6, "否则") == 1) { return 17; }
+        if (Src::eq(ctx, start, 6, "遍历") == 1) { return 26; }
+        if (Src::eq(ctx, start, 6, "循环") == 1) { return 18; }
+        if (Src::eq(ctx, start, 6, "返回") == 1) { return 19; }
+        if (Src::eq(ctx, start, 6, "模块") == 1) { return 11; }
+        if (Src::eq(ctx, start, 6, "部件") == 1) { return 67; }
+        if (Src::eq(ctx, start, 6, "访问") == 1) { return 68; }
+        if (Src::eq(ctx, start, 6, "高级") == 1) { return 69; }
+        if (Src::eq(ctx, start, 6, "结构") == 1) { return 70; }
+        if (Src::eq(ctx, start, 6, "重复") == 1) { return 28; }
+        if (Src::eq(ctx, start, 6, "匹配") == 1) { return 64; }
+        if (Src::eq(ctx, start, 6, "公开") == 1) { return 71; }
+        if (Src::eq(ctx, start, 6, "私有") == 1) { return 72; }
+        if (Src::eq(ctx, start, 6, "自动") == 1) { return 73; }
+        if (Src::eq(ctx, start, 6, "元组") == 1) { return 65; }
+        if (Src::eq(ctx, start, 6, "类型") == 1) { return 74; }
+        if (Src::eq(ctx, start, 6, "转换") == 1) { return 61; }
+        if (Src::eq(ctx, start, 6, "新建") == 1) { return 62; }
+        if (Src::eq(ctx, start, 6, "释放") == 1) { return 63; }
+        if (Src::eq(ctx, start, 6, "输出") == 1) { return 23; }
+        if (Src::eq(ctx, start, 6, "输入") == 1) { return 66; }
+        return 2;
+    }
+    if (len == 7) {
+        if (Src::eq(ctx, start, 7, "private") == 1) { return 72; }
         return 2;
     }
     if (len == 8) {
-        if (Src::eq(ctx, start, 8, "continue") == 1) {
-            return 25;
-        }
+        if (Src::eq(ctx, start, 8, "continue") == 1) { return 25; }
+        if (Src::eq(ctx, start, 8, "大小Of") == 1) { return 60; }
+        if (Src::eq(ctx, start, 8, "类型Of") == 1) { return 60; }
         return 2;
     }
     return 2;
@@ -572,6 +628,61 @@ create.mod Lex::scanIdent(ptr.int ctx, int base).int {
     Ctx::set(ctx, 408, 0);
     Ctx::set(ctx, 416, 0);
     return Lex::putTok(ctx, base, Lex::keyword(ctx, start, len));
+}
+
+create.mod Lex::scanCjkIdent(ptr.int ctx, int base).int {
+    create.int start = Ctx::get(ctx, 376);
+    while (Lex::cjkAt(ctx, Ctx::get(ctx, 16)) == 1) {
+        Lex::take(ctx);
+        Lex::take(ctx);
+        Lex::take(ctx);
+    }
+    create.int len = Ctx::get(ctx, 16) - start;
+    if (len > 128) {
+        return Lex::fail(ctx, 4);
+    }
+    Ctx::set(ctx, 400, len);
+    Ctx::set(ctx, 408, 0);
+    Ctx::set(ctx, 416, 0);
+    return Lex::putTok(ctx, base, Lex::keyword(ctx, start, len));
+}
+
+create.mod Lex::scanCjkStr(ptr.int ctx, int base).int {
+    create.int dataStart = Ctx::get(ctx, 224);
+    create.int out = 0;
+    create.int ok = 1;
+    Lex::take(ctx);
+    Lex::take(ctx);
+    Lex::take(ctx);
+    while (1 == 1) {
+        create.int c = Src::byte(ctx, Ctx::get(ctx, 16));
+        if (c == 0) {
+            return Lex::fail(ctx, 1);
+        }
+        if (c == 227 && Src::byte(ctx, Ctx::get(ctx, 16) + 1) == 128) {
+            create.int c2 = Src::byte(ctx, Ctx::get(ctx, 16) + 2);
+            if (c2 == 141 || c2 == 139) {
+                Lex::take(ctx);
+                Lex::take(ctx);
+                Lex::take(ctx);
+                Lex::putData(ctx, 0);
+                Ctx::set(ctx, 400, out);
+                Ctx::set(ctx, 408, 0);
+                Ctx::set(ctx, 416, dataStart);
+                return Lex::putTok(ctx, base, 4);
+            }
+        }
+        if (out >= 65535) {
+            return Lex::fail(ctx, 5);
+        }
+        ok = Lex::putData(ctx, c);
+        if (ok == 0) {
+            return Lex::fail(ctx, 5);
+        }
+        out = out + 1;
+        Lex::take(ctx);
+    }
+    return Lex::fail(ctx, 1);
 }
 
 create.mod Lex::scanInt(ptr.int ctx, int base).int {
@@ -702,7 +813,7 @@ create.mod Lex::scanPunct(ptr.int ctx, int base, int c).int {
             k = 30;
             len = 2;
         } else {
-            return Lex::fail(ctx, 6);
+            k = 57;
         }
     } else {
         if (c == 46) {
@@ -850,8 +961,62 @@ create.mod Lex::scanInto(ptr.int ctx, int base).int {
     if (c == 0) {
         return Lex::putTok(ctx, base, 0);
     }
+    if (c == 227) {
+        create.int b1 = Src::byte(ctx, Ctx::get(ctx, 16) + 1);
+        create.int b2 = Src::byte(ctx, Ctx::get(ctx, 16) + 2);
+        if (b1 == 128) {
+            if (b2 == 130) {
+                Lex::take(ctx);
+                Lex::take(ctx);
+                Lex::take(ctx);
+                return Lex::putTok(ctx, base, 39);
+            }
+            if (b2 == 140 || b2 == 143) {
+                return Lex::scanCjkStr(ctx, base);
+            }
+            if (b2 == 129 || b2 == 128) {
+                Lex::take(ctx);
+                Lex::take(ctx);
+                Lex::take(ctx);
+                return Lex::scanInto(ctx, base);
+            }
+        }
+    }
+    if (c == 239) {
+        create.int b1 = Src::byte(ctx, Ctx::get(ctx, 16) + 1);
+        create.int b2 = Src::byte(ctx, Ctx::get(ctx, 16) + 2);
+        if (b1 == 188) {
+            if (b2 == 140) {
+                Lex::take(ctx);
+                Lex::take(ctx);
+                Lex::take(ctx);
+                return Lex::scanInto(ctx, base);
+            }
+            if (b2 == 154) {
+                Lex::take(ctx);
+                Lex::take(ctx);
+                Lex::take(ctx);
+                return Lex::putTok(ctx, base, 57);
+            }
+            if (b2 == 136) {
+                Lex::take(ctx);
+                Lex::take(ctx);
+                Lex::take(ctx);
+                return Lex::putTok(ctx, base, 34);
+            }
+            if (b2 == 137) {
+                Lex::take(ctx);
+                Lex::take(ctx);
+                Lex::take(ctx);
+                return Lex::putTok(ctx, base, 35);
+            }
+        }
+    }
     if (Lex::isAlpha(c) == 1) {
         return Lex::scanIdent(ctx, base);
+    }
+    if (Lex::isCjkLead(c) == 1) {
+        return Lex::scanCjkIdent(ctx, base);
     }
     if (Lex::isDigit(c) == 1) {
         return Lex::scanInt(ctx, base);
@@ -2314,6 +2479,49 @@ create.mod Expr::parse(ptr.int ctx, int minPrec).int {
                             Ctx::set(ctx, 512, 0);
                             Lex::next(ctx);
                         } else {
+                            if (k == 59) {
+                                Code::movImm64(ctx, 0, 0);
+                                Ctx::set(ctx, 512, 3);
+                                Lex::next(ctx);
+                            } else {
+                            if (k == 60) {
+                                Lex::next(ctx);
+                                if (Parse::expect(ctx, 34, 6) == 0) { return 0; }
+                                if (Parse::valueType(ctx) < 0) { return 0; }
+                                if (Parse::expect(ctx, 35, 7) == 0) { return 0; }
+                                Code::movImm64(ctx, 0, 8);
+                                Ctx::set(ctx, 512, 0);
+                            } else {
+                            if (k == 61) {
+                                Lex::next(ctx);
+                                if (Parse::expect(ctx, 34, 6) == 0) { return 0; }
+                                if (Parse::valueType(ctx) < 0) { return 0; }
+                                if (Parse::expect(ctx, 38, 8) == 0) { return 0; }
+                                if (Expr::parse(ctx, 1) == 0) { return 0; }
+                                if (Parse::expect(ctx, 35, 7) == 0) { return 0; }
+                            } else {
+                            if (k == 62) {
+                                Lex::next(ctx);
+                                if (Parse::valueType(ctx) < 0) { return 0; }
+                                Code::movImm64(ctx, 1, 8);
+                                create.int np = Code::call(ctx);
+                                Code::patchRel(ctx, np, Ctx::get(ctx, 480));
+                                Code::u8(ctx, 72);
+                                Code::u8(ctx, 199);
+                                Code::u8(ctx, 0);
+                                Code::u32(ctx, 0);
+                                Ctx::set(ctx, 512, 3);
+                            } else {
+                            if (k == 63) {
+                                Lex::next(ctx);
+                                if (Expr::parse(ctx, 1) == 0) { return 0; }
+                                Code::u8(ctx, 72);
+                                Code::u8(ctx, 137);
+                                Code::u8(ctx, 193);
+                                create.int dp = Code::call(ctx);
+                                Code::patchRel(ctx, dp, Ctx::get(ctx, 488));
+                                Ctx::set(ctx, 512, 4);
+                            } else {
                             if (k == 34) {
                                 Lex::next(ctx);
                                 if (Expr::parse(ctx, 1) == 0) { return 0; }
@@ -2516,6 +2724,10 @@ create.mod Parse::valueType(ptr.int ctx).int {
         Lex::next(ctx);
         return 3;
     }
+    if (k == 58) {
+        Lex::next(ctx);
+        return 0;
+    }
     if (k == 14) {
         Lex::next(ctx);
         if (Parse::expect(ctx, 31, 2) == 0) { return 0 - 1; }
@@ -2531,6 +2743,7 @@ create.mod Parse::retType(ptr.int ctx).int {
     if (k == 12) { Lex::next(ctx); return 0; }
     if (k == 13) { Lex::next(ctx); return 1; }
     if (k == 15) { Lex::next(ctx); return 3; }
+    if (k == 58) { Lex::next(ctx); return 0; }
     Parse::fail(ctx, 31);
     return 0 - 1;
 }
