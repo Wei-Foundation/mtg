@@ -74,7 +74,7 @@ mtg build hello.wei -o hello       # Linux
 Windows：
 
 ```bat
-hello.exe
+.\hello.exe
 ```
 
 Linux：

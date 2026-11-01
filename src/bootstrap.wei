@@ -400,17 +400,6 @@ create.mod Lex::isCjkCont(int c).int {
     return 0;
 }
 
-create.mod Lex::cjkAt(ptr.int ctx, int p).int {
-    create.int a = Src::byte(ctx, p);
-    if (Lex::isCjkLead(a) == 0) { return 0; }
-    create.int b = Src::byte(ctx, p + 1);
-    create.int c = Src::byte(ctx, p + 2);
-    if (Lex::isCjkCont(b) == 0 || Lex::isCjkCont(c) == 0) { return 0; }
-    create.int cp = (a - 224) * 4096 + (b - 128) * 64 + (c - 128);
-    if (cp >= 19968 && cp <= 40959) { return 1; }
-    return 0;
-}
-
 create.mod Src::byte(ptr.int ctx, int off).int {
     create.ptr.int base = Cast::toPtr(Ctx::get(ctx, 0));
     return __byte_at(base, off);
@@ -429,6 +418,17 @@ create.mod Src::eq(ptr.int ctx, int start, int len, char lit).int {
         i = i + 1;
     }
     return 1;
+}
+
+create.mod Lex::cjkAt(ptr.int ctx, int p).int {
+    create.int a = Src::byte(ctx, p);
+    if (Lex::isCjkLead(a) == 0) { return 0; }
+    create.int b = Src::byte(ctx, p + 1);
+    create.int c = Src::byte(ctx, p + 2);
+    if (Lex::isCjkCont(b) == 0 || Lex::isCjkCont(c) == 0) { return 0; }
+    create.int cp = (a - 224) * 4096 + (b - 128) * 64 + (c - 128);
+    if (cp >= 19968 && cp <= 40959) { return 1; }
+    return 0;
 }
 
 create.mod Lex::fail(ptr.int ctx, int code).int {
@@ -647,6 +647,40 @@ create.mod Lex::scanCjkIdent(ptr.int ctx, int base).int {
     return Lex::putTok(ctx, base, Lex::keyword(ctx, start, len));
 }
 
+create.mod Lex::scanInt(ptr.int ctx, int base).int {
+    create.int start = Ctx::get(ctx, 376);
+    create.int v = 0;
+    create.int d = 0;
+    create.int c = Src::byte(ctx, Ctx::get(ctx, 16));
+    while (Lex::isDigit(c) == 1) {
+        d = c - 48;
+        if (v > 922337203685477580) {
+            return Lex::fail(ctx, 3);
+        }
+        if (v == 922337203685477580 && d > 7) {
+            return Lex::fail(ctx, 3);
+        }
+        v = v * 10 + d;
+        Lex::take(ctx);
+        c = Src::byte(ctx, Ctx::get(ctx, 16));
+    }
+    Ctx::set(ctx, 400, Ctx::get(ctx, 16) - start);
+    Ctx::set(ctx, 408, v);
+    Ctx::set(ctx, 416, 0);
+    return Lex::putTok(ctx, base, 3);
+}
+
+create.mod Lex::putData(ptr.int ctx, int b).int {
+    create.int pos = Ctx::get(ctx, 224);
+    if (pos >= 524832) {
+        return 0;
+    }
+    create.ptr.int base = Cast::toPtr(Ctx::get(ctx, 208));
+    __store_byte(base, pos, b);
+    Ctx::set(ctx, 224, pos + 1);
+    return 1;
+}
+
 create.mod Lex::scanCjkStr(ptr.int ctx, int base).int {
     create.int dataStart = Ctx::get(ctx, 224);
     create.int out = 0;
@@ -683,40 +717,6 @@ create.mod Lex::scanCjkStr(ptr.int ctx, int base).int {
         Lex::take(ctx);
     }
     return Lex::fail(ctx, 1);
-}
-
-create.mod Lex::scanInt(ptr.int ctx, int base).int {
-    create.int start = Ctx::get(ctx, 376);
-    create.int v = 0;
-    create.int d = 0;
-    create.int c = Src::byte(ctx, Ctx::get(ctx, 16));
-    while (Lex::isDigit(c) == 1) {
-        d = c - 48;
-        if (v > 922337203685477580) {
-            return Lex::fail(ctx, 3);
-        }
-        if (v == 922337203685477580 && d > 7) {
-            return Lex::fail(ctx, 3);
-        }
-        v = v * 10 + d;
-        Lex::take(ctx);
-        c = Src::byte(ctx, Ctx::get(ctx, 16));
-    }
-    Ctx::set(ctx, 400, Ctx::get(ctx, 16) - start);
-    Ctx::set(ctx, 408, v);
-    Ctx::set(ctx, 416, 0);
-    return Lex::putTok(ctx, base, 3);
-}
-
-create.mod Lex::putData(ptr.int ctx, int b).int {
-    create.int pos = Ctx::get(ctx, 224);
-    if (pos >= 524832) {
-        return 0;
-    }
-    create.ptr.int base = Cast::toPtr(Ctx::get(ctx, 208));
-    __store_byte(base, pos, b);
-    Ctx::set(ctx, 224, pos + 1);
-    return 1;
 }
 
 create.mod Lex::scanStr(ptr.int ctx, int base).int {
@@ -2023,7 +2023,10 @@ create.mod Err::text(int code).char {
     if (code == 31) { return "expected return type"; }
     if (code == 32) { return "expected array subscript"; }
     if (code == 33) { return "expected builtin call"; }
+    if (code == 34) { return "unknown part or part member"; }
+    if (code == 35) { return "part initializer must be a constant"; }
     if (code == 36) { return "expected integer literal"; }
+    if (code == 38) { return "expected ':'"; }
     if (code == 37) { return "expression temp slots exhausted"; }
     return "syntax error";
 }
@@ -2284,6 +2287,53 @@ create.mod Blk::set(ptr.int ctx, int depth, int field, int value) {
     Ctx::set(ctx, 1024 + depth * 64 + field, value);
 }
 
+create.mod Part::get(ptr.int ctx, int i, int field).int {
+    return Ctx::get(ctx, 8192 + i * 80 + field);
+}
+
+create.mod Part::set(ptr.int ctx, int i, int field, int value) {
+    Ctx::set(ctx, 8192 + i * 80 + field, value);
+}
+
+// Module / part / member names are read from ctx scratch tokens 560..600.
+create.mod Part::add(ptr.int ctx, int ty, int value, int dataOff).int {
+    create.int n = Ctx::get(ctx, 5504);
+    if (n >= 256) {
+        Parse::fail(ctx, 29);
+        return 0 - 1;
+    }
+    Part::set(ctx, n, 0, Ctx::get(ctx, 560));
+    Part::set(ctx, n, 8, Ctx::get(ctx, 568));
+    Part::set(ctx, n, 16, Ctx::get(ctx, 576));
+    Part::set(ctx, n, 24, Ctx::get(ctx, 584));
+    Part::set(ctx, n, 32, Ctx::get(ctx, 592));
+    Part::set(ctx, n, 40, Ctx::get(ctx, 600));
+    Part::set(ctx, n, 48, ty);
+    Part::set(ctx, n, 56, value);
+    Part::set(ctx, n, 64, dataOff);
+    Ctx::set(ctx, 5504, n + 1);
+    return n;
+}
+
+create.mod Part::find(ptr.int ctx, int memOff, int memLen).int {
+    create.int n = Ctx::get(ctx, 5504);
+    create.int i = 0;
+    while (i < n) {
+        if (Src::eqRange(ctx, Part::get(ctx, i, 0), Ctx::get(ctx, 560), Ctx::get(ctx, 568)) == 1) {
+            if (Src::eqRange(ctx, Part::get(ctx, i, 16), Ctx::get(ctx, 576), Ctx::get(ctx, 584)) == 1) {
+                if (memOff < 0) {
+                    return i;
+                }
+                if (Src::eqRange(ctx, Part::get(ctx, i, 32), memOff, memLen) == 1) {
+                    return i;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
 create.mod Parse::push(ptr.int ctx, int kind, int jump1, int loopStart).int {
     create.int depth = Ctx::get(ctx, 520);
     if (depth >= 64) {
@@ -2442,6 +2492,34 @@ create.mod Expr::prec(int k).int {
     return 0;
 }
 
+create.mod Parse::valueType(ptr.int ctx).int {
+    create.int k = Ctx::get(ctx, 72);
+    if (k == 12) {
+        Lex::next(ctx);
+        return 0;
+    }
+    if (k == 13) {
+        Lex::next(ctx);
+        return 1;
+    }
+    if (k == 15) {
+        Lex::next(ctx);
+        return 3;
+    }
+    if (k == 58) {
+        Lex::next(ctx);
+        return 0;
+    }
+    if (k == 14) {
+        Lex::next(ctx);
+        if (Parse::expect(ctx, 31, 2) == 0) { return 0 - 1; }
+        if (Parse::expect(ctx, 12, 11) == 0) { return 0 - 1; }
+        return 2;
+    }
+    Parse::fail(ctx, 11);
+    return 0 - 1;
+}
+
 create.mod Expr::parse(ptr.int ctx, int minPrec).int {
     create.int k = Ctx::get(ctx, 72);
     if (k == 48) {
@@ -2552,6 +2630,16 @@ create.mod Expr::parse(ptr.int ctx, int minPrec).int {
                                                 Lex::next(ctx);
                                             }
                                         }
+                                        if (arrLen > 0 && Ctx::get(ctx, 72) == 31 && Ctx::get(ctx, 128) == 3) {
+                                            Lex::next(ctx);
+                                            create.int ti = Ctx::get(ctx, 96);
+                                            Lex::next(ctx);
+                                            if (ti < 0 || ti >= arrLen) { return Parse::fail(ctx, 32); }
+                                            Code::leaSlotOff(ctx, 1, slot, (arrLen - 1) * 8);
+                                            Code::movImm64(ctx, 0, ti);
+                                            Code::loadElem(ctx);
+                                            Ctx::set(ctx, 512, 0);
+                                        }
                                         if (Ctx::get(ctx, 72) == 36) {
                                             if (arrLen <= 0) { return Parse::fail(ctx, 32); }
                                             Lex::next(ctx);
@@ -2567,6 +2655,35 @@ create.mod Expr::parse(ptr.int ctx, int minPrec).int {
                                         create.int mode = 1;
                                         Ident::saveTo(ctx, 560);
                                         Lex::next(ctx);
+                                        if (Ctx::get(ctx, 72) == 44) {
+                                            Lex::next(ctx);
+                                            if (Ctx::get(ctx, 72) != 2) { return Parse::fail(ctx, 4); }
+                                            Ident::saveTo(ctx, 576);
+                                            Lex::next(ctx);
+                                            create.int hasField = 0;
+                                            if (Ctx::get(ctx, 72) == 31) {
+                                                Lex::next(ctx);
+                                                if (Ctx::get(ctx, 72) != 2) { return Parse::fail(ctx, 4); }
+                                                Ident::saveTo(ctx, 592);
+                                                Lex::next(ctx);
+                                                hasField = 1;
+                                            }
+                                            create.int mo = -1;
+                                            if (hasField == 1) {
+                                                mo = Ctx::get(ctx, 592);
+                                            }
+                                            create.int pi = Part::find(ctx, mo, Ctx::get(ctx, 600));
+                                            if (pi < 0) { return Parse::fail(ctx, 34); }
+                                            if (Part::get(ctx, pi, 48) == 1) {
+                                                create.int lp = Code::leaRip(ctx, 0);
+                                                Fix::addData(ctx, lp, Part::get(ctx, pi, 64));
+                                                Ctx::set(ctx, 512, 1);
+                                            } else {
+                                                Code::movImm64(ctx, 0, Part::get(ctx, pi, 56));
+                                                Ctx::set(ctx, 512, 0);
+                                            }
+                                            return 1;
+                                        }
                                         if (Ctx::get(ctx, 72) == 30) {
                                             Lex::next(ctx);
                                             if (Ctx::get(ctx, 72) != 2) { return Parse::fail(ctx, 4); }
@@ -2626,6 +2743,11 @@ create.mod Expr::parse(ptr.int ctx, int minPrec).int {
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
                     }
                 }
             }
@@ -2710,34 +2832,6 @@ create.mod Expr::parse(ptr.int ctx, int minPrec).int {
     return 1;
 }
 
-create.mod Parse::valueType(ptr.int ctx).int {
-    create.int k = Ctx::get(ctx, 72);
-    if (k == 12) {
-        Lex::next(ctx);
-        return 0;
-    }
-    if (k == 13) {
-        Lex::next(ctx);
-        return 1;
-    }
-    if (k == 15) {
-        Lex::next(ctx);
-        return 3;
-    }
-    if (k == 58) {
-        Lex::next(ctx);
-        return 0;
-    }
-    if (k == 14) {
-        Lex::next(ctx);
-        if (Parse::expect(ctx, 31, 2) == 0) { return 0 - 1; }
-        if (Parse::expect(ctx, 12, 11) == 0) { return 0 - 1; }
-        return 2;
-    }
-    Parse::fail(ctx, 11);
-    return 0 - 1;
-}
-
 create.mod Parse::retType(ptr.int ctx).int {
     create.int k = Ctx::get(ctx, 72);
     if (k == 12) { Lex::next(ctx); return 0; }
@@ -2748,9 +2842,49 @@ create.mod Parse::retType(ptr.int ctx).int {
     return 0 - 1;
 }
 
+create.mod Parse::tupleVar(ptr.int ctx).int {
+    Lex::next(ctx);
+    if (Ctx::get(ctx, 72) != 2) { return Parse::fail(ctx, 4); }
+    Ident::saveTo(ctx, 560);
+    Lex::next(ctx);
+    if (Parse::expect(ctx, 40, 24) == 0) { return 0; }
+    if (Parse::expect(ctx, 34, 6) == 0) { return 0; }
+    create.int tempBase = Ctx::get(ctx, 280);
+    create.int n = 0;
+    create.int more = 1;
+    if (Ctx::get(ctx, 72) != 35) {
+        while (more == 1) {
+            if (n >= 64) { return Parse::fail(ctx, 15); }
+            if (Expr::parse(ctx, 1) == 0) { return 0; }
+            Code::movSlotReg(ctx, tempBase + n, 0);
+            n = n + 1;
+            if (Ctx::get(ctx, 72) == 38) {
+                Lex::next(ctx);
+            } else {
+                more = 0;
+            }
+        }
+    }
+    if (Parse::expect(ctx, 35, 7) == 0) { return 0; }
+    if (n == 0) { return Parse::fail(ctx, 36); }
+    create.int idx = Loc::addAt(ctx, 0, n, 560);
+    if (idx < 0) { return 0; }
+    create.int slot = Loc::get(ctx, idx, 16);
+    create.int i = 0;
+    while (i < n) {
+        Code::movRegSlot(ctx, 0, tempBase + i);
+        Code::movSlotReg(ctx, slot + n - 1 - i, 0);
+        i = i + 1;
+    }
+    return Parse::expect(ctx, 39, 10);
+}
+
 create.mod Parse::var(ptr.int ctx).int {
     Lex::next(ctx);
     if (Parse::expect(ctx, 31, 2) == 0) { return 0; }
+    if (Ctx::get(ctx, 72) == 65) {
+        return Parse::tupleVar(ctx);
+    }
     create.int ty = Parse::valueType(ctx);
     if (ty < 0) { return 0; }
     if (Ctx::get(ctx, 72) != 2) { return Parse::fail(ctx, 4); }
@@ -3146,6 +3280,113 @@ create.mod Parse::loopDepth(ptr.int ctx).int {
     return 0 - 1;
 }
 
+create.mod Parse::emitDirect(ptr.int ctx).int {
+    Lex::next(ctx);
+    if (Ctx::get(ctx, 72) == 30) {
+        Lex::next(ctx);
+    }
+    while (1 == 1) {
+        if (Expr::parse(ctx, 1) == 0) { return 0; }
+        Code::movRegReg(ctx, 2, 0);
+        create.int fmt = 512;
+        if (Ctx::get(ctx, 512) == 1) { fmt = 528; }
+        create.int p = Code::leaRip(ctx, 1);
+        Fix::addData(ctx, p, fmt);
+        Code::xorEax(ctx);
+        Code::callIat(ctx, 0);
+        if (Ctx::get(ctx, 72) != 38) {
+            return Parse::expect(ctx, 39, 10);
+        }
+        Lex::next(ctx);
+    }
+    return 1;
+}
+
+// match uses block kinds 10 (match) and 11 (case body). The main statement
+// loop in Parse::body drives cases, so match nests inside any block.
+create.mod Parse::matchStmt(ptr.int ctx).int {
+    Lex::next(ctx);
+    if (Parse::expect(ctx, 34, 6) == 0) { return 0; }
+    if (Expr::parse(ctx, 1) == 0) { return 0; }
+    if (Parse::expect(ctx, 35, 7) == 0) { return 0; }
+    create.int savedTop = Ctx::get(ctx, 280);
+    create.int temp = 68 + savedTop;
+    Ctx::set(ctx, 280, savedTop + 1);
+    Code::movSlotReg(ctx, temp, 0);
+    if (Parse::expect(ctx, 32, 8) == 0) { return 0; }
+    if (Parse::push(ctx, 10, temp, 0) == 0) { return 0; }
+    create.int depth = Ctx::get(ctx, 520) - 1;
+    Blk::set(ctx, depth, 32, 0);
+    Blk::set(ctx, depth, 56, savedTop);
+    return 1;
+}
+
+create.mod Parse::matchCase(ptr.int ctx, int depth).int {
+    create.int temp = Blk::get(ctx, depth, 16);
+    create.int isDefault = 0;
+    if (Ctx::get(ctx, 72) == 64) {
+        isDefault = 1;
+        Lex::next(ctx);
+    } else {
+        if (Ctx::get(ctx, 72) == 2 && Ctx::get(ctx, 128) == 57) {
+            if (Ident::eqCur(ctx, "_") == 1) {
+                isDefault = 1;
+                Lex::next(ctx);
+            }
+        }
+    }
+    create.int skip = 0;
+    if (isDefault == 0) {
+        if (Expr::parse(ctx, 1) == 0) { return 0; }
+        create.int pslot = 68 + Ctx::get(ctx, 280);
+        Ctx::set(ctx, 280, Ctx::get(ctx, 280) + 1);
+        Code::movSlotReg(ctx, pslot, 0);
+        Code::movRegSlot(ctx, 1, temp);
+        Code::movRegSlot(ctx, 0, pslot);
+        Code::cmpRcxRax(ctx);
+        skip = Code::jcc(ctx, 5);
+        Ctx::set(ctx, 280, pslot - 68);
+    }
+    if (Parse::expect(ctx, 57, 38) == 0) { return 0; }
+    if (Parse::expect(ctx, 32, 8) == 0) { return 0; }
+    if (Parse::push(ctx, 11, skip, 0) == 0) { return 0; }
+    create.int cd = Ctx::get(ctx, 520) - 1;
+    Blk::set(ctx, cd, 40, depth);
+    return 1;
+}
+
+create.mod Parse::closeCase(ptr.int ctx, int depth, int saved).int {
+    create.int parent = Blk::get(ctx, depth, 40);
+    create.int jp = Code::jmp(ctx);
+    create.int cnt = Blk::get(ctx, parent, 32);
+    Ctx::set(ctx, 32768 + parent * 256 + cnt * 8, jp);
+    Blk::set(ctx, parent, 32, cnt + 1);
+    create.int skip = Blk::get(ctx, depth, 16);
+    Lex::next(ctx);
+    if (skip != 0) {
+        Code::patchRel(ctx, skip, Code::pos(ctx));
+    }
+    Ctx::set(ctx, 256, saved);
+    Ctx::set(ctx, 280, Blk::get(ctx, depth, 56));
+    Ctx::set(ctx, 520, depth);
+    return 1;
+}
+
+create.mod Parse::closeMatch(ptr.int ctx, int depth, int saved).int {
+    create.int end = Code::pos(ctx);
+    create.int cnt = Blk::get(ctx, depth, 32);
+    create.int i = 0;
+    while (i < cnt) {
+        Code::patchRel(ctx, Ctx::get(ctx, 32768 + depth * 256 + i * 8), end);
+        i = i + 1;
+    }
+    Lex::next(ctx);
+    Ctx::set(ctx, 256, saved);
+    Ctx::set(ctx, 280, Blk::get(ctx, depth, 56));
+    Ctx::set(ctx, 520, depth);
+    return 1;
+}
+
 create.mod Parse::breakStmt(ptr.int ctx).int {
     Lex::next(ctx);
     create.int d = Parse::loopDepth(ctx);
@@ -3166,6 +3407,8 @@ create.mod Parse::stmt(ptr.int ctx).int {
     create.int k = Ctx::get(ctx, 72);
     if (k == 10) { return Parse::var(ctx); }
     if (k == 22) { return Parse::emitStmt(ctx); }
+    if (k == 23) { return Parse::emitDirect(ctx); }
+    if (k == 64) { return Parse::matchStmt(ctx); }
     if (k == 19) { return Parse::ret(ctx); }
     if (k == 16) { return Parse::ifStmt(ctx); }
     if (k == 18) { return Parse::whileStmt(ctx); }
@@ -3267,22 +3510,102 @@ create.mod Parse::body(ptr.int ctx, int fnIdx).int {
             if (kind == 0) {
                 return Parse::closeFn(ctx, depth, saved);
             }
-            if (kind == 1 || kind == 2) {
-                if (Parse::closeIf(ctx, depth, kind, saved) == 0) { return 0; }
+            if (kind == 10) {
+                if (Parse::closeMatch(ctx, depth, saved) == 0) { return 0; }
             } else {
-                if (kind == 3 || kind == 7 || kind == 8 || kind == 9) {
-                    if (Parse::closeLoop(ctx, depth, kind, saved) == 0) { return 0; }
+            if (kind == 11) {
+                if (Parse::closeCase(ctx, depth, saved) == 0) { return 0; }
+            } else {
+                if (kind == 1 || kind == 2) {
+                    if (Parse::closeIf(ctx, depth, kind, saved) == 0) { return 0; }
                 } else {
-                    Lex::next(ctx);
-                    Ctx::set(ctx, 256, saved);
-                    Ctx::set(ctx, 520, depth);
+                    if (kind == 3 || kind == 7 || kind == 8 || kind == 9) {
+                        if (Parse::closeLoop(ctx, depth, kind, saved) == 0) { return 0; }
+                    } else {
+                        Lex::next(ctx);
+                        Ctx::set(ctx, 256, saved);
+                        Ctx::set(ctx, 520, depth);
+                    }
                 }
             }
         } else {
-            if (Parse::stmt(ctx) == 0) { return 0; }
+            create.int top = Ctx::get(ctx, 520) - 1;
+            if (Blk::get(ctx, top, 0) == 10) {
+                if (Parse::matchCase(ctx, top) == 0) { return 0; }
+            } else {
+                if (Parse::stmt(ctx) == 0) { return 0; }
+            }
         }
     }
     return 1;
+}
+
+create.mod Parse::partDecl(ptr.int ctx, int modOff, int modLen).int {
+    Lex::next(ctx);
+    while (Ctx::get(ctx, 72) == 31) {
+        Lex::next(ctx);
+        if (Ctx::get(ctx, 72) != 70 && Ctx::get(ctx, 72) != 71 && Ctx::get(ctx, 72) != 72) {
+            return Parse::fail(ctx, 12);
+        }
+        Lex::next(ctx);
+    }
+    if (Ctx::get(ctx, 72) != 2) { return Parse::fail(ctx, 4); }
+    Ident::saveTo(ctx, 576);
+    Lex::next(ctx);
+    if (Parse::expect(ctx, 32, 8) == 0) { return 0; }
+    while (Ctx::get(ctx, 72) != 33) {
+        if (Ctx::get(ctx, 72) == 0) { return Parse::fail(ctx, 9); }
+        create.int ty = Parse::valueType(ctx);
+        if (ty < 0) { return 0; }
+        if (Ctx::get(ctx, 72) != 2) { return Parse::fail(ctx, 4); }
+        Ident::saveTo(ctx, 592);
+        Lex::next(ctx);
+        create.int value = 0;
+        create.int dataOff = 0;
+        create.int mty = ty;
+        if (Ctx::get(ctx, 72) == 40) {
+            Lex::next(ctx);
+            if (Ctx::get(ctx, 72) == 3) {
+                value = Ctx::get(ctx, 96);
+                Lex::next(ctx);
+            } else {
+                if (Ctx::get(ctx, 72) == 20) {
+                    value = 1;
+                    Lex::next(ctx);
+                } else {
+                    if (Ctx::get(ctx, 72) == 21) {
+                        value = 0;
+                        Lex::next(ctx);
+                    } else {
+                        if (Ctx::get(ctx, 72) == 4) {
+                            mty = 1;
+                            dataOff = Ctx::get(ctx, 104);
+                            Lex::next(ctx);
+                        } else {
+                            return Parse::fail(ctx, 35);
+                        }
+                    }
+                }
+            }
+        }
+        if (Parse::expect(ctx, 39, 10) == 0) { return 0; }
+        if (Part::add(ctx, mty, value, dataOff) < 0) {
+            return 0;
+        }
+    }
+    return Parse::expect(ctx, 33, 9);
+}
+
+create.mod Parse::moduleBlock(ptr.int ctx).int {
+    create.int modOff = Ctx::get(ctx, 560);
+    create.int modLen = Ctx::get(ctx, 568);
+    if (Parse::expect(ctx, 32, 8) == 0) { return 0; }
+    while (Ctx::get(ctx, 72) != 33) {
+        if (Ctx::get(ctx, 72) == 0) { return Parse::fail(ctx, 9); }
+        if (Ctx::get(ctx, 72) != 67) { return Parse::fail(ctx, 12); }
+        if (Parse::partDecl(ctx, modOff, modLen) == 0) { return 0; }
+    }
+    return Parse::expect(ctx, 33, 9);
 }
 
 create.mod Parse::fnDecl(ptr.int ctx).int {
@@ -3292,6 +3615,9 @@ create.mod Parse::fnDecl(ptr.int ctx).int {
     if (Ctx::get(ctx, 72) != 2) { return Parse::fail(ctx, 4); }
     Ident::saveTo(ctx, 560);
     Lex::next(ctx);
+    if (Ctx::get(ctx, 72) == 32) {
+        return Parse::moduleBlock(ctx);
+    }
     if (Parse::expect(ctx, 30, 5) == 0) { return 0; }
     if (Ctx::get(ctx, 72) != 2) { return Parse::fail(ctx, 4); }
     Ident::saveTo(ctx, 576);
@@ -3600,6 +3926,7 @@ create.mod Main::main() {
     Ctx::set(ctx, 504, 0);
     Ctx::set(ctx, 512, 0);
     Ctx::set(ctx, 520, 0);
+    Ctx::set(ctx, 5504, 0);
     Rt::init(ctx);
     Lex::init(ctx, src, n);
     if (Ctx::get(ctx, 72) == 1) {
