@@ -1,0 +1,15 @@
+create.mod Math::div(int a, int b).Result {
+    if (b == 0) { return -7; }
+    return a / b;
+}
+
+create.mod Math::safe(int a, int b).Result {
+    create.int v = Math::div(a, b)?;
+    return v + 100;
+}
+
+create.mod Main::main().Result {
+    create.int v = Math::safe(20, 0)?;
+    do.emit::v;
+    return 0;
+}

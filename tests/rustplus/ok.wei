@@ -1,0 +1,10 @@
+create.mod Math::div(int a, int b).Result {
+    if (b == 0) { return -1; }
+    return a / b;
+}
+
+create.mod Main::main().Result {
+    create.int v = Math::div(20, 4)?;
+    do.emit::v;
+    return 0;
+}

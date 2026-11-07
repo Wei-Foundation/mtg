@@ -19,6 +19,7 @@
 - [快速开始](#快速开始)
 - [语言示例](#语言示例)
   - [文言文扫雷](#文言文扫雷)
+- [错误处理与诊断](#错误处理与诊断)
 - [从源码构建](#从源码构建)
 - [子集自举（进行中）](#子集自举进行中)
 - [项目结构](#项目结构)
@@ -101,6 +102,7 @@ mtg build <文件.wei> [选项]
 | `-no-opt` | 关闭编译期优化 |
 | `-ir` | 启用实验性 IR 后端 |
 | `-wide` | 使用 128 位宽算术（实验性，速度约为一半） |
+| `-no-error-trace` | 关闭 `?` 错误传播链的站点打印（默认开启，见[错误处理与诊断](#错误处理与诊断)） |
 | `--version` | 显示编译器版本与后端信息 |
 
 > 在 Windows 控制台中，如果直接输入 `-std:中文` 出现乱码，可改用等价的
@@ -257,6 +259,85 @@ mtg build saolei.wenyan.wei -std:wenyan -o saolei
 源码约 370 行，入口为 `create.mod Main::main()`；雷区、状态、邻雷数与漫延栈
 各用一个 81 元素的数组表示。汉字数字拆成 `漢字`、`漢尾`、`漢數` 三个函数生成，
 避免在函数调用后直接接条件分支。
+
+---
+
+## 错误处理与诊断
+
+### Result 与 `?`
+
+用 `.Result` 声明函数返回显式错误，约定返回值 `>= 0` 为 `Ok(值)`、`< 0` 为
+`Err(-错误码)`；`?` 把 `Err` 沿调用栈向上传播：
+
+```wei
+create.mod Math::div(int a, int b).Result {
+    if (b == 0) { return -7; }
+    return a / b;
+}
+
+create.mod Math::safe(int a, int b).Result {
+    create.int v = Math::div(a, b)?;
+    return v + 100;
+}
+
+create.mod Main::main().Result {
+    create.int v = Math::safe(20, 0)?;
+    do.emit::v;
+    return 0;
+}
+```
+
+`?` 只能出现在返回 `.Result` 的函数里，否则编译器报 `E0277` 并把 `^` 精确
+标在 `?` 上 —— 错误码必须有人接住，不能像 C 那样静默忽略返回值。
+
+### 自动错误传播链
+
+Rust 的 `?` 只把 `Err` 原样上抛，想知道它经过哪些调用点通常得借助
+`anyhow` 与 `RUST_BACKTRACE`。MTG 在**编译期**把每个 `?` 的源文件、行列、
+所在函数与被调函数写进生成物，出错时由内向外逐层打印，不需要任何第三方库，
+也不依赖运行时符号表：
+
+```text
+[错误传播] trace.wei:7:35   Math::safe   Math::div()?
+[错误传播] trace.wei:12:37  Main::main   Math::safe()?
+```
+
+`Main::main` 的 `?` 触发时，还会以错误码的绝对值结束进程（上例退出码为 `7`），
+避免错误被静默吞掉。加 `-no-error-trace` 可关闭站点打印，此时生成代码里
+不注入任何额外指令：
+
+```bash
+mtg build trace.wei -o trace.exe -no-error-trace
+```
+
+### 错误码手册
+
+诊断里的每个错误码都能在编译器内置手册中查到，中英双语、含成因、最小复现
+与可直接编译的修复片段，完全离线：
+
+```bash
+mtg --list-codes       # 列出全部错误码
+mtg explain E0277      # 等价于 mtg --explain E0277
+```
+
+```
+error[E0277]: '?' 只能在返回 Result 的函数中使用
+           The '?' operator requires a Result-returning function
+
+  成因 / 错误示例 / 修复 ...
+```
+
+若诊断以富文本形式输出，颜色会自动按 TTY 开关，也可通过 `NO_COLOR` 或
+`WEI_FORCE_COLOR` 覆盖；`help` 行会直接提示可查询的手册命令。
+
+### 验收
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\rustplus\run.ps1
+```
+
+该脚本覆盖错误码手册、Ok/Err 两条路径、两层传播链、关闭开关以及 `E0277`
+精确诊断共 19 项断言。
 
 ---
 

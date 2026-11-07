@@ -51,6 +51,9 @@
 #include <unordered_map>
 #include <variant>
 #include <vector>
+#include <unistd.h>
+#include <climits>
+#include <cctype>
 
 /* ==========================================================================
  * 128 位整数 wei_i128
@@ -230,6 +233,7 @@ enum class TokType {
 	Plus, Minus, Star, Slash, Percent, PlusPlus, MinusMinus, Amp,
 	Assign, PlusEq, MinusEq, StarEq, SlashEq,
 	Caret, Pipe, Tilde, Shl, Shr,          /* ^ | ~ << >> 位运算 */
+	Question,                              /* '?' —— Result 错误传播后缀 */
 	EqEq, Neq, LtEq,
 	GtEq,
 	And, Or, Not,
@@ -853,6 +857,9 @@ namespace wei::ast {
 		std::string callee;
 		std::vector<std::string> type_args;    /* 显式类型实参: f<int>(x) */
 		std::vector<std::unique_ptr<Expr>> args;
+		bool has_try = false;                  /* f()? —— Result 错误传播 */
+		int try_line = 0;                      /* '?' 自身的位置：诊断精确指向它 */
+		int try_col = 0;
 		int line = 0;
 		int col = 0;
 	};
@@ -1531,8 +1538,788 @@ Token Lexer::makeToken(TokType t, std::string text, int32_t line, int32_t col) {
 	return Token(t, std::move(text), line, col);
 }
 
+
+/* ==========================================================================
+ * 诊断系统 wei::diag —— Rust 风格的富文本错误报告
+ *
+ * 目标: 报错不再只是一行 "xxx at 12:5"，而是像 Rust 那样给出
+ *   · 错误码（E0101），可检索
+ *   · 粗体标题 + 彩色分级（红=错误，黄=警告）
+ *   · 源码片段 + 行号 + 精确列指向
+ *   · 多级标注（主标注紫 ^^^ / 次标注青 ---），可跨行
+ *   · help / note 建议，含"你是不是想写 xxx"拼写建议
+ *
+ * 两个易错点已在实现中处理:
+ *   1) CJK 宽字符在终端占 2 列，标注必须按**显示宽度**对齐，否则错位
+ *   2) 非 TTY（管道/重定向）或 NO_COLOR 时必须关掉颜色
+ * ========================================================================== */
+namespace wei::diag {
+
+	/* ── 颜色控制 ────────────────────────────────────────────────────── */
+	inline bool& colorFlag() { static bool b = true; return b; }
+	inline bool useColor() { return colorFlag(); }
+	inline void setColorEnabled(bool v) { colorFlag() = v; }
+
+	/* 自动检测: 非 TTY 或 NO_COLOR 时关色 */
+	inline void detectColor() {
+		const char* nc = std::getenv("NO_COLOR");
+		if (nc && nc[0] != '\0') { colorFlag() = false; return; }
+		if (std::getenv("WEI_FORCE_COLOR")) { colorFlag() = true; return; }
+#ifdef _WIN32
+		colorFlag() = true;
+#else
+		colorFlag() = (isatty(STDERR_FILENO) != 0);
+#endif
+	}
+
+	/* ── 显示宽度: CJK/全角算 2 列 ───────────────────────────────────── */
+	inline bool isUtf8Lead(unsigned char c) { return (c & 0xC0) != 0x80; }
+
+	inline int codePointWidth(uint32_t cp) {
+		/* 组合字符（如声调）宽度为 0 */
+		if (cp == 0) return 0;
+		if (cp >= 0x0300 && cp <= 0x036F) return 0;
+		if (cp >= 0x1AB0 && cp <= 0x1AFF) return 0;
+		if (cp >= 0x1DC0 && cp <= 0x1DFF) return 0;
+		if (cp >= 0x20D0 && cp <= 0x20FF) return 0;
+		if (cp >= 0xFE20 && cp <= 0xFE2F) return 0;
+		/* 全角/宽字符区间 */
+		if (cp >= 0x1100 && cp <= 0x115F) return 2;
+		if (cp >= 0x2E80 && cp <= 0x303E) return 2;
+		if (cp >= 0x3041 && cp <= 0x33FF) return 2;
+		if (cp >= 0x3400 && cp <= 0x4DBF) return 2;
+		if (cp >= 0x4E00 && cp <= 0x9FFF) return 2;
+		if (cp >= 0xA000 && cp <= 0xA4CF) return 2;
+		if (cp >= 0xAC00 && cp <= 0xD7A3) return 2;
+		if (cp >= 0xF900 && cp <= 0xFAFF) return 2;
+		if (cp >= 0xFE10 && cp <= 0xFE19) return 2;
+		if (cp >= 0xFE30 && cp <= 0xFE6F) return 2;
+		if (cp >= 0xFF00 && cp <= 0xFF60) return 2;
+		if (cp >= 0xFFE0 && cp <= 0xFFE6) return 2;
+		if (cp >= 0x1F300 && cp <= 0x1F64F) return 2;
+		if (cp >= 0x1F900 && cp <= 0x1F9FF) return 2;
+		if (cp >= 0x20000 && cp <= 0x3FFFD) return 2;
+		return 1;
+	}
+
+	/* 解码一个 UTF-8 码点，返回消耗的字节数 */
+	inline int utf8Decode(const std::string& s, size_t i, uint32_t& cp) {
+		unsigned char c = static_cast<unsigned char>(s[i]);
+		if (c < 0x80) { cp = c; return 1; }
+		int n = 0;
+		if ((c & 0xE0) == 0xC0) { n = 2; cp = c & 0x1F; }
+		else if ((c & 0xF0) == 0xE0) { n = 3; cp = c & 0x0F; }
+		else if ((c & 0xF8) == 0xF0) { n = 4; cp = c & 0x07; }
+		else { cp = c; return 1; }
+		if (i + (size_t)n > s.size()) { cp = c; return 1; }
+		for (int k = 1; k < n; k++) {
+			unsigned char cc = static_cast<unsigned char>(s[i + k]);
+			if ((cc & 0xC0) != 0x80) { cp = c; return 1; }
+			cp = (cp << 6) | (cc & 0x3F);
+		}
+		return n;
+	}
+
+	inline int displayWidth(const std::string& s) {
+		int w = 0;
+		size_t i = 0;
+		while (i < s.size()) {
+			uint32_t cp = 0;
+			int n = utf8Decode(s, i, cp);
+			w += codePointWidth(cp);
+			i += (size_t)n;
+		}
+		return w;
+	}
+
+	/* 取显示宽度不超过 w 的前缀（按码点切，不切断字符） */
+	inline std::string displayPrefix(const std::string& s, int w) {
+		if (w <= 0) return "";
+		int acc = 0;
+		size_t i = 0;
+		while (i < s.size()) {
+			uint32_t cp = 0;
+			int n = utf8Decode(s, i, cp);
+			int cw = codePointWidth(cp);
+			if (acc + cw > w) break;
+			acc += cw;
+			i += (size_t)n;
+		}
+		return s.substr(0, i);
+	}
+
+	/* 把字符串按显示宽度填充到 w（右补空格） */
+	inline std::string padToWidth(const std::string& s, int w) {
+		int cur = displayWidth(s);
+		if (cur >= w) return s;
+		return s + std::string((size_t)(w - cur), ' ');
+	}
+
+	/* ── ANSI 样式 ───────────────────────────────────────────────────── */
+	struct Style {
+		const char* on;
+		const char* off;
+	};
+	inline const char* S(const char* code) { return useColor() ? code : ""; }
+	inline const char* SOff() { return useColor() ? "\033[0m" : ""; }
+
+	/* ── 源码缓存 ────────────────────────────────────────────────────── */
+	class SourceCache {
+	public:
+		void setText(const std::string& text, const std::string& name) {
+			name_ = name;
+			lines_.clear();
+			std::string cur;
+			for (size_t i = 0; i < text.size(); i++) {
+				char c = text[i];
+				if (c == '\r') { continue; }
+				if (c == '\n') { lines_.push_back(cur); cur.clear(); continue; }
+				cur.push_back(c);
+			}
+			if (!cur.empty()) lines_.push_back(cur);
+		}
+		bool loadFile(const std::string& path) {
+			std::ifstream f(path, std::ios::binary);
+			if (!f) return false;
+			std::ostringstream ss;
+			ss << f.rdbuf();
+			setText(ss.str(), path);
+			return true;
+		}
+		const std::string& fileName() const { return name_; }
+		int lineCount() const { return static_cast<int>(lines_.size()); }
+		std::string line(int n) const {
+			if (n < 1 || n > static_cast<int>(lines_.size())) return "";
+			return lines_[static_cast<size_t>(n - 1)];
+		}
+	private:
+		std::string name_;
+		std::vector<std::string> lines_;
+	};
+
+	/* ── 诊断结构 ────────────────────────────────────────────────────── */
+	enum class Severity { Error, Warning, Note, Help };
+
+	struct Span {
+		int line = 0;      /* 1-based */
+		int col = 0;       /* 1-based */
+		int len = 0;       /* 按显示宽度 */
+	};
+
+	struct Label {
+		Span span;
+		std::string msg;
+		bool primary = false;
+	};
+
+	struct Diagnostic {
+		Severity sev = Severity::Error;
+		std::string code;            /* 如 "E0101" */
+		std::string message;         /* 标题 */
+		std::vector<Label> labels;   /* 至少一个；primary 决定主标注 */
+		std::vector<std::string> notes;
+		std::vector<std::string> helps;
+
+		void label(Span sp, const std::string& m, bool isPrimary = false) {
+			labels.push_back({sp, m, isPrimary});
+		}
+		void note(const std::string& m) { notes.push_back(m); }
+		void help(const std::string& m) { helps.push_back(m); }
+	};
+
+	/* 携带诊断的异常。继承 runtime_error 保证旧的 catch 全部照常工作，
+	   新流程可用 dynamic_cast 取回富信息。 */
+	struct DiagnosticError : std::runtime_error {
+		Diagnostic diag;
+		/* what() 保留旧的 "消息 at 行:列" 格式，这样任何还在用纯文本
+		   路径的地方都不会丢信息；新路径用 dynamic_cast 取 diag 走富渲染。 */
+		explicit DiagnosticError(const Diagnostic& d) : std::runtime_error(""), diag(d) {
+			std::string loc;
+			for (auto& l : d.labels) {
+				if (l.primary) { loc = " at " + std::to_string(l.span.line) + ":" + std::to_string(l.span.col); break; }
+			}
+			if (loc.empty() && !d.labels.empty())
+				loc = " at " + std::to_string(d.labels[0].span.line) + ":" + std::to_string(d.labels[0].span.col);
+			whatBuf_ = d.message + loc;
+		}
+		const char* what() const noexcept override { return whatBuf_.c_str(); }
+	private:
+		std::string whatBuf_;
+	};
+
+	/* ── 拼写建议: Levenshtein ───────────────────────────────────────── */
+	inline int editDistance(const std::string& a, const std::string& b) {
+		const size_t n = a.size(), m = b.size();
+		if (n == 0) return static_cast<int>(m);
+		if (m == 0) return static_cast<int>(n);
+		std::vector<int> prev(m + 1), cur(m + 1);
+		for (size_t j = 0; j <= m; j++) prev[j] = static_cast<int>(j);
+		for (size_t i = 1; i <= n; i++) {
+			cur[0] = static_cast<int>(i);
+			for (size_t j = 1; j <= m; j++) {
+				int cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
+				cur[j] = std::min({prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost});
+			}
+			prev.swap(cur);
+		}
+		return prev[m];
+	}
+
+	/* 找最相近的候选名；没有足够近的返回空 */
+	inline std::string suggestSimilar(const std::string& name, const std::vector<std::string>& cands) {
+		if (name.empty() || cands.empty()) return "";
+		std::string best;
+		int bestD = INT_MAX;
+		for (const auto& c : cands) {
+			int d = editDistance(name, c);
+			if (d < bestD) { bestD = d; best = c; }
+		}
+		/* 阈值随长度放宽，避免长名字误报 */
+		int limit = static_cast<int>(name.size()) / 3 + 1;
+		if (limit > 4) limit = 4;
+		if (bestD <= limit && !best.empty()) return best;
+		return "";
+	}
+
+
+
+	/* ── 错误分类与"你是不是想写"建议 ────────────────────────────────── */
+
+	/* 从消息里抽取单引号内的名字 */
+	inline std::string extractQuoted(const std::string& msg) {
+		size_t a = msg.find('\'');
+		if (a == std::string::npos) return "";
+		size_t b = msg.find('\'', a + 1);
+		if (b == std::string::npos) return "";
+		return msg.substr(a + 1, b - a - 1);
+	}
+
+	struct Classified {
+		std::string code;      /* E0101 */
+		std::string labelMsg;  /* 标在 ^^^ 后面的话 */
+		std::string help;
+	};
+
+	/* 关键字候选由外部注入（避免 diag 依赖 Parser 内部表） */
+	inline std::vector<std::string>& keywordCandidates() {
+		static std::vector<std::string> v;
+		return v;
+	}
+	inline void registerKeywords(const std::vector<std::string>& ks) {
+		keywordCandidates() = ks;
+	}
+
+	/* 内置函数名单，供"你是不是想写"建议用。
+	   它们不走普通的 scope 注册路径，所以要单独列出来。 */
+	inline const std::vector<std::string>& builtinNames() {
+		static const std::vector<std::string> v = {
+			"__atomic_add", "__atomic_cas", "__atomic_fetch_add", "__atomic_xchg", "__mfence",
+			"__thread", "__rt_alloc", "__rt_free", "__mulhi", "__umulhi", "__mullo", "__umullo",
+			"__addc", "__subb", "__byte_at", "__store_byte", "__exit", "__command_line",
+			"__file_open", "__file_close", "__file_write", "__read_file", "__write_file"
+		};
+		return v;
+	}
+
+	inline Classified classify(const std::string& msg) {
+		Classified c;
+		std::string name = extractQuoted(msg);
+
+		auto has = [&](const char* p) { return msg.find(p) != std::string::npos; };
+
+		if (has("无法识别的顶层声明")) {
+			c.code = "E0101";
+			c.labelMsg = "未知的顶层声明";
+			if (!name.empty()) {
+				std::string s = suggestSimilar(name, keywordCandidates());
+				if (!s.empty()) c.help = "你是否想写 '" + s + "'？";
+				else c.help = "顶层只接受: create.mod / package / import / trait / impl / enum 等声明";
+			}
+		} else if (has("无法识别的表达式起始 token")) {
+			c.code = "E0102";
+			c.labelMsg = "这里不是一个合法的表达式开头";
+			c.help = "检查是否漏写了运算符或操作数";
+		} else if (has("无法解析 import 模块") || has("未找到该模块的定义")) {
+			c.code = "E0201";
+			c.labelMsg = "模块未找到";
+			if (!name.empty()) c.help = "确认 lib/" + name + ".wei 存在，或用 mtg precompile 生成 .mod";
+		} else if (has("依赖") && has("未找到")) {
+			c.code = "E0202";
+			c.labelMsg = "依赖的模块不存在";
+			c.help = "requires() 里的模块必须先定义，或作为库文件存在";
+		} else if (has("未导出") || has("export")) {
+			c.code = "E0203";
+			c.labelMsg = "跨文件调用需要导出";
+			c.help = "在被调模块前加 export，例如: export create.mod 名字::f()";
+		} else if (has("循环依赖")) {
+			c.code = "E0204";
+			c.labelMsg = "依赖成环";
+			c.help = "把公共部分抽到第三个模块，让依赖变成单向";
+		} else if (has("重复定义")) {
+			c.code = "E0205";
+			c.labelMsg = "重复定义";
+		} else if (has("未定义") || has("Undefined")) {
+			c.code = "E0425";
+			c.labelMsg = "未定义的名字";
+			if (!name.empty()) {
+				std::string s = suggestSimilar(name, keywordCandidates());
+				if (!s.empty()) c.help = "你是否想写 '" + s + "'？";
+			}
+		} else if (has("类型") || has("type")) {
+			c.code = "E0308";
+			c.labelMsg = "类型不匹配";
+		} else if (has("期望")) {
+			/* "期望 ';', 实际拿到 'X'" 这类语法错: 把期望的和实际的都抽出来 */
+			c.code = "E0103";
+			std::vector<std::string> qs;
+			size_t pos = 0;
+			while (pos < msg.size()) {
+				size_t a = msg.find('\'', pos);
+				if (a == std::string::npos) break;
+				size_t b = msg.find('\'', a + 1);
+				if (b == std::string::npos) break;
+				qs.push_back(msg.substr(a + 1, b - a - 1));
+				pos = b + 1;
+			}
+			c.labelMsg = "这里不应该是 '" + (qs.size() >= 2 ? qs[1] : (qs.empty() ? "" : qs[0])) + "'";
+			if (qs.size() >= 2) {
+				c.help = "这里需要 '" + qs[0] + "'。删掉 '" + qs[1] + "' 或在其前补上 '" + qs[0] + "'";
+			}
+		} else if (has("缺少") || has("未闭合") || has("不匹配")) {
+			c.code = "E0104";
+			c.labelMsg = "括号或符号未闭合";
+			c.help = "检查配对的 ( ) { } [ ] 是否齐全";
+		} else {
+			c.code = "E0001";
+			c.labelMsg = "此处出错";
+		}
+		return c;
+	}
+
+	/* ── 渲染 ────────────────────────────────────────────────────────── */
+
+	/* tab 展开为 4 空格，返回展开后的字符串；同时给出 原始下标 -> 显示列 的映射 */
+	inline std::string expandTabs(const std::string& line, std::vector<int>& colMap) {
+		std::string out;
+		colMap.assign(line.size() + 1, 0);
+		int disp = 0;
+		size_t i = 0;
+		while (i < line.size()) {
+			colMap[i] = disp;
+			if (line[i] == '\t') {
+				int toNext = 4 - (disp % 4);
+				out.append((size_t)toNext, ' ');
+				disp += toNext;
+				i++;
+				continue;
+			}
+			/* 必须按 utf8Decode 返回的字节数推进，不能 i++。
+			   否则中文等多字节字符的后继字节会被当成独立字符，
+			   宽度重复累加，标注列就会整体偏移（实测中文行完全画不出 ^）。 */
+			uint32_t cp = 0;
+			int n = utf8Decode(line, i, cp);
+			out.append(line, i, (size_t)n);
+			disp += codePointWidth(cp);
+			i += (size_t)n;
+		}
+		colMap[line.size()] = disp;
+		return out;
+	}
+
+	inline int digitsOf(int n) {
+		if (n <= 0) return 1;
+		int d = 0;
+		while (n > 0) { d++; n /= 10; }
+		return d;
+	}
+
+	/* 渲染单条诊断 */
+	inline std::string render(const Diagnostic& d, const SourceCache& src) {
+		std::ostringstream o;
+		const std::string BOLD = "\033[1m";
+		const std::string RED = "\033[31m";
+		const std::string BRED = "\033[1;31m";
+		const std::string BYEL = "\033[1;33m";
+		const std::string BCYN = "\033[1;36m";
+		const std::string CYN = "\033[36m";
+		const std::string BMAG = "\033[1;35m";
+		const std::string BGRN = "\033[1;32m";
+		const std::string DIM = "\033[2m";
+		const std::string R = "\033[0m";
+
+		auto B = [&](const std::string& s, const std::string& style) -> std::string {
+			return useColor() ? (style + s + R) : s;
+		};
+
+		if (d.labels.empty()) return "";
+
+		/* 头部: error[E0101]: 消息 */
+		const char* sevName = "error";
+		std::string sevStyle = BRED;
+		if (d.sev == Severity::Warning) { sevName = "warning"; sevStyle = BYEL; }
+		else if (d.sev == Severity::Note) { sevName = "note"; sevStyle = BCYN; }
+		else if (d.sev == Severity::Help) { sevName = "help"; sevStyle = BGRN; }
+
+		std::string head = std::string(sevName);
+		if (!d.code.empty()) head += "[" + d.code + "]";
+		o << B(head, sevStyle) << ": " << B(d.message, BOLD) << "\n";
+
+		/* 主标注: 决定 --> 指向哪 */
+		const Label* prim = nullptr;
+		for (auto& l : d.labels) if (l.primary) { prim = &l; break; }
+		if (!prim) prim = &d.labels[0];
+
+		/* 位置行 */
+		std::string loc = src.fileName().empty() ? "<unknown>" : src.fileName();
+		o << std::string(digitsOf(prim->span.line) + 1, ' ')
+		  << B("--> ", BCYN) << loc << ":" << prim->span.line << ":" << prim->span.col << "\n";
+
+		/* 收集涉及的源码行，排序去重 */
+		std::vector<int> rows;
+		for (auto& l : d.labels) {
+			if (l.span.line >= 1) rows.push_back(l.span.line);
+		}
+		std::sort(rows.begin(), rows.end());
+		rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+
+		int maxRow = rows.empty() ? 1 : rows.back();
+		int gutter = digitsOf(maxRow);
+
+		auto gutterStr = [&](int n) {
+			std::string s = std::to_string(n);
+			return B(padToWidth(s, gutter), BOLD + (useColor() ? "\033[36m" : ""));
+		};
+		auto blankGutter = [&]() { return std::string((size_t)gutter + 1, ' '); };
+
+		for (size_t ri = 0; ri < rows.size(); ri++) {
+			int ln = rows[ri];
+			std::string raw = src.line(ln);
+			std::vector<int> colMap;
+			std::string text = expandTabs(raw, colMap);
+
+			/* 分隔行 */
+			o << blankGutter() << B("|", BCYN) << "\n";
+
+			/* 源码行 */
+			o << " " << gutterStr(ln) << " " << B("|", BCYN) << " " << text << "\n";
+
+			/* 该行上的所有标注，按列排序 */
+			std::vector<const Label*> onRow;
+			for (auto& l : d.labels) if (l.span.line == ln) onRow.push_back(&l);
+			std::sort(onRow.begin(), onRow.end(), [](const Label* a, const Label* b) {
+				if (a->span.col != b->span.col) return a->span.col < b->span.col;
+				return a->primary && !b->primary;
+			});
+
+			/* 画 underline。多标注共存时，用 occupancy 数组避免互相覆盖 */
+			std::vector<char> marks(displayWidth(text) + 2, ' ');
+			std::vector<bool> isPrim(displayWidth(text) + 2, false);
+			for (auto* l : onRow) {
+				int startCol = 0;
+				/* 原始 col (1-based) -> 显示列 */
+				int rawIdx = l->span.col - 1;
+				if (rawIdx >= 0 && rawIdx < (int)colMap.size()) startCol = colMap[rawIdx];
+				else if (rawIdx >= (int)colMap.size() && !colMap.empty()) startCol = colMap.back();
+				int len = l->span.len > 0 ? l->span.len : 1;
+				for (int k = 0; k < len; k++) {
+					int p = startCol + k;
+					if (p < 0 || p >= (int)marks.size()) continue;
+					/* 主标注覆盖次标注 */
+					if (marks[p] == ' ' || l->primary) {
+						marks[p] = l->primary ? '^' : '-';
+						isPrim[p] = l->primary;
+					}
+				}
+			}
+
+			/* 输出 underline。
+			   BUGFIX: 空格必须照样输出，否则标注会全部挤到行首对不准列。
+			   之前用 `continue` 跳过了空格，结果 ^^^ 永远贴在最左边。 */
+			std::string underline;
+			size_t p = 0;
+			while (p < marks.size()) {
+				if (marks[p] == ' ') {
+					size_t q = p;
+					while (q < marks.size() && marks[q] == ' ') q++;
+					underline.append((size_t)(q - p), ' ');
+					p = q;
+					continue;
+				}
+				size_t q = p;
+				while (q < marks.size() && marks[q] != ' ' && isPrim[q] == isPrim[p]) q++;
+				std::string seg((size_t)(q - p), marks[p]);
+				underline += isPrim[p] ? (B(seg, BMAG)) : (B(seg, CYN));
+				p = q;
+			}
+
+			/* 单个标注: 消息直接跟在 ^^^ 后面。
+			   多个标注: underline 不带消息，避免歧义，改在下面逐条列出。 */
+			/* 去掉尾部多余空格: marks 数组比实际行长，不 trim 会在
+			   消息前留一大段空白。空格都是裸字符（未着色），可安全 rtrim。 */
+			while (!underline.empty() && underline.back() == ' ') underline.pop_back();
+
+			const Label* tailLabel = nullptr;
+			for (auto* l : onRow) if (!l->msg.empty()) tailLabel = l;
+
+			o << blankGutter() << B("|", BCYN) << " " << underline;
+			if (onRow.size() == 1 && tailLabel) {
+				o << " " << B(tailLabel->msg, tailLabel->primary ? BMAG : CYN);
+			}
+			o << "\n";
+
+			if (onRow.size() > 1) {
+				for (auto* l : onRow) {
+					std::string marker = l->primary ? "^" : "-";
+					o << blankGutter() << B("|", BCYN) << " "
+					  << B(marker, l->primary ? BMAG : CYN) << " "
+					  << (l->msg.empty() ? "" : l->msg) << "\n";
+				}
+			}
+		}
+
+		/* notes */
+		for (auto& n : d.notes) {
+			o << blankGutter() << B("= note: ", BCYN) << n << "\n";
+		}
+		/* helps */
+		for (auto& h : d.helps) {
+			o << blankGutter() << B("= help: ", BGRN) << h << "\n";
+		}
+		return o.str();
+	}
+
+	inline void emit(const Diagnostic& d, const SourceCache& src) {
+		std::string s = render(d, src);
+		if (!s.empty()) std::fwrite(s.data(), 1, s.size(), stderr);
+	}
+
+	/* 便捷构造 */
+	inline Diagnostic makeError(const std::string& code, const std::string& msg, Span sp) {
+		Diagnostic d;
+		d.sev = Severity::Error;
+		d.code = code;
+		d.message = msg;
+		d.labels.push_back({sp, "", true});
+		return d;
+	}
+
+	/* ── 内置错误码手册 ─────────────────────────────────────────────────
+	   rustc --explain 只有英文说明，且不带可直接编译的修复片段。MTG 把
+	   手册编进编译器本体：中英双语 + 成因 + 最小复现 + 修复示例，完全离线。
+	   编译器报出的每个 code 都保证能在这里查到（codeBook 与 classify 同源维护）。 */
+	struct CodeDoc {
+		const char* code;
+		const char* title_zh;
+		const char* title_en;
+		const char* why_zh;
+		const char* bad;   /* 最小复现 */
+		const char* fix;   /* 可直接编译的修复片段 */
+	};
+
+	inline const std::vector<CodeDoc>& codeBook() {
+		static const std::vector<CodeDoc> v = {
+			{"E0001", "未分类的语法或语义错误", "Unclassified syntax/semantic error",
+			 "编译器遇到了无法归入既有类别的错误。通常伴随一条原始消息，按其中的行列号定位。",
+			 R"wei(create.mod Main::main() {
+    do.emit::;
+})wei",
+			 R"wei(create.mod Main::main() {
+    do.emit::"Hello";
+})wei"},
+			{"E0100", "词法错误", "Lexical error",
+			 "源码里出现了词法器无法组成 token 的字节，例如非法 UTF-8、未闭合的字符串或未知符号。",
+			 R"wei(create.mod Main::main() {
+    do.emit::"未闭合;
+})wei",
+			 R"wei(create.mod Main::main() {
+    do.emit::"已闭合";
+})wei"},
+			{"E0101", "未知的顶层声明", "Unknown top-level declaration",
+			 "顶层只接受 create.mod / package / import / trait / impl / enum / export 等声明，其它写法会被拒绝。",
+			 R"wei(moduel Main::main() {
+})wei",
+			 R"wei(create.mod Main::main() {
+})wei"},
+			{"E0102", "非法的表达式起始", "Invalid expression start",
+			 "运算符或操作数缺失，导致该位置无法开始一个表达式。",
+			 R"wei(create.mod Main::main() {
+    create.int x = * 3;
+})wei",
+			 R"wei(create.mod Main::main() {
+    create.int x = 2 * 3;
+})wei"},
+			{"E0103", "语法符号不符合预期", "Unexpected token",
+			 "解析器在此处需要另一个符号（常见是漏了分号、括号或 ::）。",
+			 R"wei(create.mod Main::main() {
+    create.int x = 3
+    do.emit::x;
+})wei",
+			 R"wei(create.mod Main::main() {
+    create.int x = 3;
+    do.emit::x;
+})wei"},
+			{"E0104", "括号或符号未闭合", "Unclosed delimiter",
+			 "( ) { } [ ] 没有配对，或字符串/注释跨到了文件结尾。",
+			 R"wei(create.mod Main::main() {
+    if (1 == 1) {
+        do.emit::1;
+})wei",
+			 R"wei(create.mod Main::main() {
+    if (1 == 1) {
+        do.emit::1;
+    }
+})wei"},
+			{"E0201", "模块未找到", "Module not found",
+			 "import 指向的文件不存在。可用 mtg precompile 预编译成 .mod 加速重复引用。",
+			 R"wei(import lib/Missing;
+create.mod Main::main() {
+})wei",
+			 R"wei(/* lib/Missing.wei 需存在，或先执行:
+   mtg precompile lib/Missing.wei  */
+create.mod Main::main() {
+})wei"},
+			{"E0202", "依赖的模块不存在", "Required dependency missing",
+			 "requires() 声明的模块必须先定义，或作为库文件存在于搜索路径中。",
+			 R"wei(requires("Ghost");
+create.mod Main::main() {
+})wei",
+			 R"wei(create.mod Ghost {
+}
+create.mod Main::main() {
+})wei"},
+			{"E0203", "跨文件调用需要导出", "Not exported",
+			 "模块成员默认文件私有；跨文件调用必须在定义处加 export。",
+			 R"wei(/* lib/A.wei */
+create.mod A::f().int { return 1; })wei",
+			 R"wei(/* lib/A.wei */
+export create.mod A::f().int { return 1; })wei"},
+			{"E0204", "依赖成环", "Circular dependency",
+			 "模块之间互相依赖，加载顺序无法确定。把公共部分抽到第三个模块即可。",
+			 R"wei(/* A requires B, B 又 requires A */)wei",
+			 R"wei(/* 把 A、B 共用的定义移到 Common，
+   A requires Common，B requires Common */)wei"},
+			{"E0205", "重复定义", "Duplicate definition",
+			 "同一作用域内出现了两个同名定义（模块、函数、部件或变量）。",
+			 R"wei(create.mod Main::main() {
+    create.int x = 1;
+    create.int x = 2;
+})wei",
+			 R"wei(create.mod Main::main() {
+    create.int x = 1;
+    x = 2;
+})wei"},
+			{"E0277", "'?' 只能在返回 Result 的函数中使用", "The '?' operator requires a Result-returning function",
+			 "错误码必须有人接住。'?' 会把 Err 沿调用栈向上传播，若当前函数不返回 .Result，"
+			 "错误码会被静默丢弃 —— 这正是 C 风格忽略返回值的老毛病，编译期直接拦住。",
+			 R"wei(create.mod Math::div(int a, int b).Result {
+    if (b == 0) { return -1; }
+    return a / b;
+}
+create.mod Main::main() {
+    create.int v = Math::div(10, 2)?;
+})wei",
+			 R"wei(create.mod Math::div(int a, int b).Result {
+    if (b == 0) { return -1; }
+    return a / b;
+}
+create.mod Main::main().Result {
+    create.int v = Math::div(10, 2)?;
+    do.emit::v;
+    return 0;
+})wei"},
+			{"E0308", "类型不匹配", "Type mismatch",
+			 "表达式的静态类型与期望类型不一致（例如把字符串赋给整型，或返回类型不符）。",
+			 R"wei(create.mod Main::main() {
+    create.int x = "hello";
+})wei",
+			 R"wei(create.mod Main::main() {
+    create.int x = 42;
+})wei"},
+			{"E0425", "未定义的名字", "Name not resolved",
+			 "变量、函数或模块成员在使用前没有定义；编译器会按编辑距离给出最接近的候选。",
+			 R"wei(create.mod Main::main() {
+    do.emit::coumt;
+})wei",
+			 R"wei(create.mod Main::main() {
+    create.int count = 1;
+    do.emit::count;
+})wei"}
+		};
+		return v;
+	}
+
+	inline const CodeDoc* findCode(const std::string& raw) {
+		std::string code = raw;
+		if (!code.empty() && code[0] == 'e') code[0] = 'E';
+		for (const auto& d : codeBook())
+			if (code == d.code) return &d;
+		return nullptr;
+	}
+
+	/* 打印单个错误码的完整条目；未收录时列出可用码并返回 2。 */
+	inline int printExplain(const std::string& code) {
+		const CodeDoc* d = findCode(code);
+		if (!d) {
+			std::fprintf(stderr, "未知错误码 '%s'。用 mtg --list-codes 查看全部错误码。\n", code.c_str());
+			return 2;
+		}
+		std::printf("error[%s]: %s\n", d->code, d->title_zh);
+		std::printf("           %s\n\n", d->title_en);
+		std::printf("  成因\n  ----\n  %s\n\n", d->why_zh);
+		std::printf("  错误示例\n  --------\n");
+		{
+			std::string s = d->bad;
+			size_t p = 0;
+			while (p <= s.size()) {
+				size_t e = s.find('\n', p);
+				std::printf("    %s\n", s.substr(p, e == std::string::npos ? std::string::npos : e - p).c_str());
+				if (e == std::string::npos) break;
+				p = e + 1;
+			}
+		}
+		std::printf("\n  修复\n  ----\n");
+		{
+			std::string s = d->fix;
+			size_t p = 0;
+			while (p <= s.size()) {
+				size_t e = s.find('\n', p);
+				std::printf("    %s\n", s.substr(p, e == std::string::npos ? std::string::npos : e - p).c_str());
+				if (e == std::string::npos) break;
+				p = e + 1;
+			}
+		}
+		std::printf("\n  提示: mtg --list-codes 查看全部错误码；"
+		            "mtg build x.wei -no-error-trace 可关闭 '?' 传播链。\n");
+		return 0;
+	}
+
+	inline int listCodes() {
+		const auto& b = codeBook();
+		std::printf("MTG 错误码索引（%zu 条）\n", b.size());
+		for (const auto& d : b)
+			/* 按显示宽度补齐：CJK 占 2 列，%-Ns 按字节算会把中文列挤歪 */
+			std::printf("  %-7s %s  %s\n", d.code,
+			            padToWidth(d.title_zh, 30).c_str(), d.title_en);
+		std::printf("\n用法: mtg explain E0277   或   mtg --explain E0277\n");
+		return 0;
+	}
+
+	/* '?' 传播链开关。默认开启：编译期在每个 '?' 的 Err 分支注入站点信息，
+	   运行时逐层打印，无需 anyhow/backtrace 之类的第三方库。 */
+	inline bool& errorTraceFlag() { static bool b = true; return b; }
+	inline void setErrorTrace(bool v) { errorTraceFlag() = v; }
+
+}  // namespace wei::diag
+
 [[noreturn]] void Lexer::die(const std::string& msg, int32_t line, int32_t col) const {
-	throw std::runtime_error("lex error at " + std::to_string(line) + ":" + std::to_string(col) + " " + msg);
+	wei::diag::Classified c = wei::diag::classify(msg);
+	wei::diag::Diagnostic d;
+	d.sev = wei::diag::Severity::Error;
+	d.code = c.code.empty() ? "E0100" : c.code;
+	d.message = msg;
+	d.labels.push_back({{line, col, 1}, c.labelMsg.empty() ? "词法错误" : c.labelMsg, true});
+	if (!c.help.empty()) d.help(c.help);
+	throw wei::diag::DiagnosticError(d);
 }
 //字面意??
 Token Lexer::readNumber() {
@@ -1701,6 +2488,8 @@ Token Lexer::readOpOrPunct() {
 	int32_t line = line_;
 	int32_t col = col_;
 	unsigned char b = static_cast<unsigned char>(peek());
+	/* '?' —— Result 错误传播: f()?  若 f 返回 Err 则当前函数立即返回该错误 */
+	if (b == '?') { get(); return makeToken(TokType::Question, "?", line, col); }
 	if (b == 0xEF) {
 		if (static_cast<unsigned char>(peek(1)) == 0xBC && static_cast<unsigned char>(peek(2)) == 0x9A) {
 			get();
@@ -1903,7 +2692,24 @@ std::vector<Token> Lexer::scan() {
 			continue;
 		}
 		if ((b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '_') {
-			out.push_back(readIdentOrKeyword());
+			Token t = readIdentOrKeyword();
+			/* `M::u8` 这类成员名：宽度关键字在 `::` 之后按普通标识符处理。
+			   自举源码里有 Code::u8 / Code::u16 / Code::u32 / Code::u64 等
+			   发射函数；把它们一律当保留字会让 stage0 无法重建 stage1，
+			   fixpoint 直接断在第一个 Code::u8 定义处。只按"前一个 token
+			   是 ::"这一处上下文放宽，类型位置上的 u8/u16/... 仍是关键字，
+			   其余语法完全不受影响。 */
+			if (!out.empty() && out.back().type == TokType::DoubleColon) {
+				switch (t.type) {
+				case TokType::Kw_u8:  case TokType::Kw_u16: case TokType::Kw_u32:
+				case TokType::Kw_u64: case TokType::Kw_i8:  case TokType::Kw_i16:
+				case TokType::Kw_i64: case TokType::Kw_f32: case TokType::Kw_f64:
+					t.type = TokType::Ident;
+					break;
+				default: break;
+				}
+			}
+			out.push_back(t);
 			continue;
 		}
 		if (isCjkLead(b)) {
@@ -2036,6 +2842,9 @@ class Parser {
 		/* 编译期命名常量表: enum 成员、const 声明都落在里 */
 		std::map<std::string, int64_t> named_consts_;
 		std::map<std::string, wei::ast::EnumDecl> enums_;
+		/* 变量名 -> 枚举名。用于 switch 的穷尽性检查:
+		   create.Color c = Red; 之后 switch(c) 才知道要覆盖 Color 的全部成员。 */
+		std::map<std::string, std::string> enum_vars_;
 		std::map<std::string, wei::ast::UnionDecl> unions_;
 		std::unique_ptr<wei::ast::Stmt> parseSwitchStmt();
 		std::unique_ptr<wei::ast::Stmt> parseDeferStmt();
@@ -2550,7 +3359,16 @@ const Token& Parser::expect(TokType t, const std::string& desc) {
 	return tk;
 }
 [[noreturn]] void Parser::die(const std::string& msg, const Token& at) const {
-	throw std::runtime_error(msg + " at " + std::to_string(at.line) + ":" + std::to_string(at.col));
+	wei::diag::Classified c = wei::diag::classify(msg);
+	wei::diag::Diagnostic d;
+	d.sev = wei::diag::Severity::Error;
+	d.code = c.code;
+	d.message = msg;
+	int len = static_cast<int>(at.text.size());
+	if (len <= 0) len = 1;
+	d.labels.push_back({{at.line, at.col, len}, c.labelMsg, true});
+	if (!c.help.empty()) d.help(c.help);
+	throw wei::diag::DiagnosticError(d);
 }
 [[noreturn]] void Parser::die(const std::string& msg) const {
 	die(msg, cur());
@@ -2670,6 +3488,14 @@ std::string Parser::typeKwText(TokType t) {
 }
 /* 返回类型后缀: (参数).int / (参数).double */
 void Parser::eatRetType(FuncDecl& fd) {
+	/* Result 返回类型: .Result —— Rust 风格的显式错误返回（非异常、非 OO）。
+	   编码约定: rax >= 0 为 Ok(值)，rax < 0 为 Err(-错误码)。
+	   用单个寄存器承载，函数返回路径无需改动。 */
+	if (check(TokType::Dot) && checkAt(1, TokType::Ident) && peek(1).text == "Result") {
+		pos_++; pos_++;
+		fd.ret_type = "Result";
+		return;
+	}
 	/* 泛型返回类型: .T */
 	if (check(TokType::Dot) && checkAt(1, TokType::Ident) && cur_type_params_.count(peek(1).text)) {
 		pos_++;
@@ -3050,7 +3876,13 @@ std::unique_ptr<wei::ast::Stmt> Parser::parseSwitchStmt() {
 			c.is_default = (toks[i] == "default");
 			i++;
 			if (!c.is_default && i < toks.size()) {
-				c.const_val = atoll(toks[i].c_str());
+				/* 先查命名常量（枚举成员等），再退回数值。
+				   原来直接 atoll("Red") 得 0，导致 case Red 与 case Green
+				   的常量值都是 0 —— 枚举匹配静默失效。 */
+				const std::string& tv = toks[i];
+				auto nit = named_consts_.find(tv);
+				if (nit != named_consts_.end()) c.const_val = nit->second;
+				else c.const_val = atoll(tv.c_str());
 				i++;
 			}
 			if (i < toks.size() && toks[i] == ":") i++;
@@ -3077,6 +3909,47 @@ std::unique_ptr<wei::ast::Stmt> Parser::parseSwitchStmt() {
 			sw.cases.push_back(std::move(c));
 		} else i++;
 	}
+
+	/* ── 穷尽性检查（Rust match 的核心保证）─────────────────────────────
+	   若 switch 的 subject 是枚举变量，且没有 default 分支，
+	   则每个枚举成员都必须被某个 case 覆盖，否则编译期报错。
+	   这能在重构枚举（新增成员）时立刻发现所有漏改的 switch。 */
+	if (sw.subject) {
+		if (auto* id = std::get_if<wei::ast::Ident>(sw.subject.get())) {
+			auto vit = enum_vars_.find(id->name);
+			if (vit != enum_vars_.end()) {
+				auto eit = enums_.find(vit->second);
+				if (eit != enums_.end() && !eit->second.members.empty()) {
+					bool hasDefault = false;
+					std::set<int64_t> covered;
+					for (auto& c : sw.cases) {
+						if (c.is_default) { hasDefault = true; break; }
+						covered.insert(c.const_val);
+					}
+					if (!hasDefault) {
+						std::vector<std::string> missing;
+						for (auto& m : eit->second.members)
+							if (!covered.count(m.second)) missing.push_back(m.first);
+						if (!missing.empty()) {
+							wei::diag::Diagnostic d;
+							d.sev = wei::diag::Severity::Error;
+							d.code = "E0004";
+							d.message = "switch 未覆盖枚举 '" + vit->second + "' 的全部成员";
+							d.labels.push_back({{sw.line, sw.col, 6}, "这个 switch 缺少分支", true});
+							std::string miss;
+							for (size_t k = 0; k < missing.size(); k++) {
+								if (k) miss += ", ";
+								miss += missing[k];
+							}
+							d.help("缺少: " + miss + "；补上这些 case，或加 default 分支");
+							throw wei::diag::DiagnosticError(d);
+						}
+					}
+				}
+			}
+		}
+	}
+
 	auto out = std::make_unique<wei::ast::Stmt>();
 	*out = std::move(sw);
 	return out;
@@ -4190,10 +5063,16 @@ Stmt Parser::parseStmt() {
 	if (isCreateKw(cur().type)) {
 		pos_++;
 		eatCreateSep();
-		if (!isTypeKw(cur().type)) {
+		/* 枚举名也是合法类型（底层 int）。不认的话 create.Color c 会报"类型未知" */
+		if (!isTypeKw(cur().type) && !enums_.count(cur().text)) {
 			die("create 后的类型未知 '" + cur().text + "'", cur());
 		}
-		std::string tn = parseTypeName();
+		/* BUGFIX: 必须先记下"是否是类型关键字"，再消费。
+		   原先在 parseTypeName() 之后又判断 cur()，此时已移到变量名上，
+		   于是 create.int c 会多消费掉 'c' —— 整条声明路径全崩。 */
+		bool wasTypeKw = isTypeKw(cur().type);
+		std::string tn = wasTypeKw ? parseTypeName() : cur().text;
+		if (!wasTypeKw) pos_++;                     /* 枚举名: 直接消费 Ident */
 		if (tn == "tuple" || tn == "元组") {
 			/* create.tuple t = (1, 2);  元组变量 */
 			return parseVarDeclStmt("tuple");
@@ -4302,6 +5181,12 @@ Stmt Parser::parseVarDeclStmt(const std::string& typeName, bool advPath) {
 	vd.name = nameTk.text;
 	vd.line = nameTk.line;
 	vd.col = nameTk.col;
+	/* 枚举名作变量类型: 底层按 underlying(默认 int) 处理，
+	   同时记录 变量->枚举 供 switch 穷尽性检查使用。 */
+	if (enums_.count(typeName)) {
+		enum_vars_[vd.name] = typeName;
+		vd.type = enums_[typeName].underlying;
+	}
 	if (check(TokType::LBracket)) {
 		pos_++;
 		const Token& lenTk = expect(TokType::IntLit, "数组长度");
@@ -5260,10 +6145,24 @@ std::unique_ptr<Expr> Parser::parsePrimary() {
 	if (check(TokType::IntLit)) {
 		auto e = std::make_unique<Expr>();
 		IntLit il;
+		/* BUGFIX: 原来只用 stoll（有符号），于是 u64 的大字面量
+		   （9223372036854775808 .. 18446744073709551615）一律被拒，
+		   即使变量声明为 u64 也写不出来 —— 这个区间本应合法。
+		   改为先按有符号试；失败再按无符号试，成功则以位模式存入
+		   int64（u64 语境下位模式即原值，128 位/无符号语义不受影响）。
+		   只有真正超过 UINT64_MAX 才报错。 */
 		try {
 			il.value = std::stoll(cur().text);
 		} catch (...) {
-			die("整数常量过大 '" + cur().text + "'", cur());
+			bool okUnsigned = false;
+			try {
+				unsigned long long uv = std::stoull(cur().text);
+				if (uv > 0x7FFFFFFFFFFFFFFFULL) {
+					il.value = static_cast<int64_t>(uv);   /* 位模式保留 */
+					okUnsigned = true;
+				}
+			} catch (...) { okUnsigned = false; }
+			if (!okUnsigned) die("整数常量过大 '" + cur().text + "'", cur());
 		}
 		pos_++;
 		*e = std::move(il);
@@ -5608,6 +6507,15 @@ std::unique_ptr<Expr> Parser::parseIdentOrCall() {
 			}
 		}
 		expect(TokType::RParen, "')'");
+		/* '?' 后缀: Result 错误传播。f()? —— 若 f 返回 Err(负数)，
+		   当前函数立即以该错误返回；否则取 Ok 值继续。 */
+		if (check(TokType::Question)) {
+			/* 先记下 '?' 自身的位置：报错时标在 '?' 上，而不是整个调用表达式上。 */
+			c.try_line = cur().line;
+			c.try_col = cur().col;
+			pos_++;
+			c.has_try = true;
+		}
 		auto e = std::make_unique<Expr>();
 		*e = std::move(c);
 		return e;
@@ -6455,7 +7363,7 @@ namespace wei::prestage {
 		if (auto* un = std::get_if<Unary>(e)) {
 			auto v = evalInt(un->operand.get(), env);
 			if (!v) return std::nullopt;
-			if (un->op == "-") return -*v;
+			if (un->op == "-") { if (*v == INT64_MIN) return std::nullopt; return -*v; }
 			if (un->op == "+") return *v;
 			if (un->op == "not") return *v ? 0 : 1;
 			return std::nullopt;
@@ -6477,11 +7385,31 @@ namespace wei::prestage {
 			auto R = evalInt(b->rhs.get(), env);
 			if (!R) return std::nullopt;
 			int64_t a = *L, c = *R;
-			if (b->op == "+") return a + c;
-			if (b->op == "-") return a - c;
-			if (b->op == "*") return a * c;
-			if (b->op == "/") { if (c == 0) return std::nullopt; return a / c; }
-			if (b->op == "%") { if (c == 0) return std::nullopt; return a % c; }
+			/* BUGFIX: 编译期求值必须用 128 位验算溢出。
+			   原来直接 `return a + c` 用 int64 静默回绕 —— 于是
+			   `s=INT64_MAX-7; while(j<100){ s=s+1000; ... }` 被折叠成
+			   一个回绕后的常量，运行时循环连同它的溢出检查一起消失，
+			   程序静默输出错误值（实测 -9223372036854675816）。
+			   这是最危险的一类 bug: 不崩溃、不报错，只是算错。
+			   现在一旦超出 int64 就返回 nullopt —— 表示"编译期算不了"，
+			   evalLoop 随即放弃折叠，运行时循环保留溢出检查并正确 panic。 */
+			auto fits = [](wei_i128 r) -> std::optional<int64_t> {
+				if (r < wei_i128(INT64_MIN) || r > wei_i128(INT64_MAX)) return std::nullopt;
+				return std::optional<int64_t>(static_cast<int64_t>(r));
+			};
+			if (b->op == "+") return fits(wei_i128(a) + wei_i128(c));
+			if (b->op == "-") return fits(wei_i128(a) - wei_i128(c));
+			if (b->op == "*") return fits(wei_i128(a) * wei_i128(c));
+			if (b->op == "/") {
+				if (c == 0) return std::nullopt;
+				if (a == INT64_MIN && c == -1) return std::nullopt;  /* 除法溢出 */
+				return a / c;
+			}
+			if (b->op == "%") {
+				if (c == 0) return std::nullopt;
+				if (a == INT64_MIN && c == -1) return std::nullopt;
+				return a % c;
+			}
 			if (b->op == "==") return a == c ? 1 : 0;
 			if (b->op == "!=") return a != c ? 1 : 0;
 			if (b->op == "<")  return a <  c ? 1 : 0;
@@ -6561,7 +7489,12 @@ namespace wei::prestage {
 							/* v = v + v → 翻倍，基值未知时无法表示 */
 							return false;
 						}
-						out.delta[as->name] += (b->op == "+") ? *ov : -*ov;
+						/* delta 累加本身也可能溢出。溢出就放弃折叠，
+						   让运行时循环保留溢出检查（不能静默算错）。 */
+						wei_i128 nd = wei_i128(out.delta[as->name])
+						            + wei_i128((b->op == "+") ? *ov : -*ov);
+						if (nd < wei_i128(INT64_MIN) || nd > wei_i128(INT64_MAX)) return false;
+						out.delta[as->name] = static_cast<int64_t>(nd);
 						out.vars.erase(as->name);
 						out.unknown.insert(as->name);
 						continue;
@@ -7673,6 +8606,9 @@ namespace wei::types {
 		if (n == "i8" || n == "i16" || n == "i32" || n == "i64"
 		        || n == "u8" || n == "u16" || n == "u32" || n == "u64") return {TypeKind::Int, ""};
 		if (n == "f32" || n == "f64") return {TypeKind::Double, ""};
+		/* Result 底层是整数编码（>=0 为 Ok 值，<0 为 Err 码），归入整型，
+		   这样类型检查、参数传递、返回路径都沿用 int 的通路。 */
+		if (n == "Result") return {TypeKind::Int, ""};
 		/* enum 归入整型（常量集合 + 底层整型）；const 是限定符不是独立类型 */
 		if (n == "enum") return {TypeKind::Int, ""};
 		if (n == "bool" || n == "布尔") return {TypeKind::Bool, ""};
@@ -8103,6 +9039,11 @@ namespace wei::types {
 				for (auto& a : node.args) {
 					if (a) inferExpr(*a, scope);
 				}
+				/* Result 构造 ok(v) / err(e): 编译器内建，不注册为普通函数，
+				   否则会被当成"未声明函数"。 */
+				if (node.callee == "ok" || node.callee == "err") {
+					return {TypeKind::Int, ""};
+				}
 				if (node.callee == "__byte_at") {
 					if (node.args.size() != 2) {
 						throw std::runtime_error("__byte_at 参数数量错误 at " + std::to_string(node.line) + ":" + std::to_string(node.col));
@@ -8197,7 +9138,24 @@ namespace wei::types {
 				}
 				auto it = scope.find(node.callee);
 				if (it == scope.end()) {
-					throw std::runtime_error("未声明函数: " + node.callee + " at " + std::to_string(node.line) + ":" + std::to_string(node.col));
+					/* 富诊断: 未声明函数。带拼写建议 —— 这是最常见的一类手误。 */
+					{
+						wei::diag::Diagnostic d;
+						d.sev = wei::diag::Severity::Error;
+						d.code = "E0425";
+						d.message = "未声明函数: '" + node.callee + "'";
+						int len = static_cast<int>(node.callee.size());
+						d.labels.push_back({{node.line, node.col, len > 0 ? len : 1}, "找不到这个函数", true});
+						/* 候选 = 当前可见函数名 + 内置函数 + 关键字表 */
+						std::vector<std::string> cands;
+						for (auto& kv : scope) cands.push_back(kv.first);
+						for (auto& b : wei::diag::builtinNames()) cands.push_back(b);
+						for (auto& k : wei::diag::keywordCandidates()) cands.push_back(k);
+						std::string sug = wei::diag::suggestSimilar(node.callee, cands);
+						if (!sug.empty()) d.help("你是否想写 '" + sug + "'？");
+						else d.note("确认该函数已定义，或对应模块已 import");
+						throw wei::diag::DiagnosticError(d);
+					}
 				}
 				if (it->second.kind != TypeKind::Func) {
 					throw std::runtime_error("非函数调用: " + node.callee + " at " + std::to_string(node.line) + ":" + std::to_string(node.col));
@@ -8316,6 +9274,8 @@ namespace wei::types {
 /* 前端输出模块                                                  */
 /* 工具链的所有打印集中在 MTC；MTG 只负责代码生成，不直接打印    */
 /* ============================================================ */
+
+
 namespace wei::front {
 	extern const char* kProgramName;
 	extern const char* kProgramVersion;
@@ -8329,6 +9289,9 @@ namespace wei::front {
 	void printBuildOK(const std::string& outExe, const std::string& targetId);
 	void printError(const std::string& msg);
 	void emitError(const std::string& file, const std::string& raw);
+	/* 富文本诊断入口: 异常若是 DiagnosticError 就渲染成 Rust 风格，
+	   否则退回纯文本（旧行为）。 */
+	void emitException(const std::string& file, const std::exception& e);
 }
 
 #ifndef WEI_FRONTEND_NO_DEFS
@@ -8383,6 +9346,30 @@ namespace wei::front {
 			std::fprintf(stderr, "%s:%d:%d: %s\n", file.c_str(), loc.line, loc.col, raw.c_str());
 		} else {
 			std::fprintf(stderr, "%s:?:?: %s\n", file.c_str(), raw.c_str());
+		}
+	}
+
+	void emitException(const std::string& file, const std::exception& e) {
+		const wei::diag::DiagnosticError* de = dynamic_cast<const wei::diag::DiagnosticError*>(&e);
+		if (de) {
+			wei::diag::SourceCache sc;
+			if (!sc.loadFile(file)) sc.setText("", file);
+			wei::diag::emit(de->diag, sc);
+			return;
+		}
+		/* 非诊断异常: 至少把源码行打出来，别只有行列号 */
+		FrontLoc loc = frontExtractLoc(e.what());
+		std::string msg = e.what();
+		if (loc.ok) {
+			wei::diag::SourceCache sc;
+			sc.loadFile(file);
+			std::string lineText = sc.line(loc.line);
+			std::fprintf(stderr, "%s:%d:%d: %s\n", file.c_str(), loc.line, loc.col, msg.c_str());
+			if (!lineText.empty()) {
+				std::fprintf(stderr, "  %d | %s\n", loc.line, lineText.c_str());
+			}
+		} else {
+			std::fprintf(stderr, "%s: %s\n", file.c_str(), msg.c_str());
 		}
 	}
 
@@ -8532,6 +9519,7 @@ namespace {
 	}
 
 	using wei::front::emitError;
+	using wei::front::emitException;
 
 	/* ── x86-64 code buffer with instruction encoding helpers ── */
 	struct X64Buf {
@@ -8841,6 +9829,41 @@ namespace {
 			modrm(3, 0, rm);
 		}
 		/* mov r64, r/m64 (8B) */
+		/* ── D1 · 函数级寄存器驻留的统一拦截层 ─────────────────────────
+		   把某个局部栈槽钉进物理寄存器后，**所有**对 [rbp+d] 的读写
+		   都必须改走寄存器。原有代码直接访问栈槽的地方有上百处，逐个
+		   改调用点既易漏又会静默算错（寄存器与内存失去同步）。
+
+		   这里在**最底层发射原语**做一次精确拦截：按 disp 精确查表，
+		   命中则改发 `mov reg, phys` / `mov phys, reg`。
+		   - 只认 base==rbp(5)
+		   - 只认精确登记过的 disp（保存寄存器槽 / canary / 临时 spill
+		     槽都不在表里，绝不会被误伤）
+		   - 未设置 hook 时行为与原来逐字节一致 */
+		std::function<int(int64_t)> slot_hook_;
+		bool slot_violation_ = false;      /* 取了驻留变量的地址 → 放弃驻留 */
+		void set_slot_hook(std::function<int(int64_t)> h) { slot_hook_ = std::move(h); slot_violation_ = false; }
+		/* 输出/外部调用 stub 在对齐栈之前会调用 save_rsp_r15()。
+		   target 里写的是 g.c_.save_rsp_r15()，NativeGen 里写的是
+		   c_.save_rsp_r15() —— 在**原语内部**挂回调才能一处全覆盖，
+		   不漏任何调用点。 */
+		std::function<void()> pre_align_;
+		void set_pre_align(std::function<void()> h) { pre_align_ = std::move(h); }
+		/* 取驻留变量的地址(LEA [rbp+d])时，后续可能经指针**写**内存，
+		   而 hook 仍以为值在寄存器里 —— 必须彻底降级到内存路径。 */
+		std::function<void()> on_slot_addr_;
+		void set_on_slot_addr(std::function<void()> h) { on_slot_addr_ = std::move(h); }
+		inline void slot_addr_taken(int64_t d, int base) {
+			if (slot_phys(d, base) >= 0 && on_slot_addr_) {
+				auto h = on_slot_addr_; on_slot_addr_ = {};
+				slot_violation_ = true;
+				h();
+			}
+		}
+		inline int slot_phys(int64_t d, int base) {
+			return (base == 5 && slot_hook_) ? slot_hook_(d) : -1;
+		}
+
 		void mov64r_rm64(int r, int rm) {
 			rex_wrb(r, rm);
 			u8(0x8B);
@@ -8864,6 +9887,8 @@ namespace {
 
 		/* mov r64, [r+disp] ??自动选择 disp8/disp32 */
 		void mov64r_memd8(int r, int base, int64_t d) {
+			int pr = slot_phys(d, base);
+			if (pr >= 0) { if (pr != r) mov64r_rm64(r, pr); return; }
 			if (d >= -128 && d <= 127) {
 				rex_wrb(r, base);
 				u8(0x8B);
@@ -8880,6 +9905,8 @@ namespace {
 		}
 		/* mov r64, [r+disp32] */
 		void mov64r_memd32(int r, int base, int32_t d) {
+			int pr = slot_phys(d, base);
+			if (pr >= 0) { if (pr != r) mov64r_rm64(r, pr); return; }
 			rex_wrb(r, base);
 			u8(0x8B);
 			modrm(2, r, base);
@@ -8888,6 +9915,8 @@ namespace {
 		}
 		/* mov [r+disp], r64 ??自动选择 disp8/disp32 */
 		void mov_memd8_64r(int base, int64_t d, int r) {
+			int pr = slot_phys(d, base);
+			if (pr >= 0) { if (pr != r) mov64r_rm64(pr, r); return; }
 			if (d >= -128 && d <= 127) {
 				rex_wrb(r, base);
 				u8(0x89);
@@ -8904,6 +9933,8 @@ namespace {
 		}
 		/* mov [r+disp32], r64 */
 		void mov_memd32_64r(int base, int32_t d, int r) {
+			int pr = slot_phys(d, base);
+			if (pr >= 0) { if (pr != r) mov64r_rm64(pr, r); return; }
 			rex_wrb(r, base);
 			u8(0x89);
 			modrm(2, r, base);
@@ -8912,6 +9943,13 @@ namespace {
 		}
 		/* mov [r+disp], imm32 ??自动选择 disp8/disp32 */
 		void mov_memd8_imm32(int base, int64_t d, int32_t v) {
+			int pr = slot_phys(d, base);
+			if (pr >= 0) {
+				/* 零/常量初始化驻留变量：直接把立即数装进物理寄存器 */
+				if (v >= INT32_MIN && v <= INT32_MAX) mov32r_imm32(pr, v);
+				else mov64r_imm64(pr, v);
+				return;
+			}
 			if (d >= -128 && d <= 127) {
 				rex_w();
 				u8(0xC7);
@@ -8979,6 +10017,7 @@ namespace {
 			u32(static_cast<uint32_t>(disp));
 		}
 		void lea64r_memd8(int r, int base, int64_t d) {
+			slot_addr_taken(d, base);
 			if (d >= -128 && d <= 127) {
 				rex_wrb(r, base);
 				u8(0x8D);
@@ -8993,6 +10032,7 @@ namespace {
 		}
 		/* lea r64, [r+disp32] */
 		void lea64r_memd32(int r, int base, int32_t d) {
+			slot_addr_taken(d, base);
 			rex_wrb(r, base);
 			u8(0x8D);
 			modrm(2, r, base);
@@ -9066,6 +10106,8 @@ namespace {
 			modrm(3, r, rm);
 		}
 		void alu_r64_memd8(uint8_t op, int r, int base, int64_t d) {
+			int pr = slot_phys(d, base);
+			if (pr >= 0) { alu_r64_rm64(op, r, pr); return; }
 			if (d >= -128 && d <= 127) {
 				rex_wrb(r, base);
 				u8(op);
@@ -9079,6 +10121,8 @@ namespace {
 			}
 		}
 		void alu_r64_memd32(uint8_t op, int r, int base, int32_t d) {
+			int pr = slot_phys(d, base);
+			if (pr >= 0) { alu_r64_rm64(op, r, pr); return; }
 			rex_wrb(r, base);
 			u8(op);
 			modrm(2, r, base);
@@ -9122,6 +10166,8 @@ namespace {
 		   时阶乘给出 1), 重则踩坏金丝雀触发 int3。
 		   故与 mov64r_memd8 / mov_memd8_64r 一样做双分支。 */
 		void add_memd8_imm32(int base, int64_t disp, int32_t v) {
+			int pr = slot_phys(disp, base);
+			if (pr >= 0) { add_rm64_imm32(pr, v); return; }
 			/* 注意: 这个局部变量**不能**命名为 near。
 			   Windows 头文件(minwindef.h 一系)把 near / far 定义成空宏以兼容
 			   16 位时代的代码, 于是 `const bool near = ...` 被展开成
@@ -9217,6 +10263,8 @@ namespace {
 			modrm(3, r, rm);
 		}
 		void imul_r64_memd8(int r, int base, int64_t d) {
+			int pr = slot_phys(d, base);
+			if (pr >= 0) { imul_r64_rm64(r, pr); return; }
 			if (d >= -128 && d <= 127) {
 				rex_wrb(r, base);
 				u8(0x0F);
@@ -9232,6 +10280,8 @@ namespace {
 			}
 		}
 		void imul_r64_memd32(int r, int base, int32_t d) {
+			int pr = slot_phys(d, base);
+			if (pr >= 0) { imul_r64_rm64(r, pr); return; }
 			rex_wrb(r, base);
 			u8(0x0F);
 			u8(0xAF);
@@ -9326,6 +10376,7 @@ namespace {
 
 		/* Dynamic stack alignment helpers (use R15 callee-saved) */
 		void save_rsp_r15() {
+			if (pre_align_) { auto h = pre_align_; pre_align_ = {}; h(); }
 			/* push r15 (save callee-saved) ; mov r15, rsp */
 			u8(0x41);
 			u8(0x57);                /* push r15 */
@@ -10227,6 +11278,33 @@ namespace {
 			   只在归纳变量**单调递增**时成立（i = i + 正常量）。若循环体里
 			   对 i 有其他形式的写入（递减、赋值成别的值），立即撤销证明。 */
 			std::map<std::string, int64_t> idx_ub_;
+			/* D1: rewrite_mod_induction_vars 生成的取模归纳变量 __modiv_* 的
+			   上界(模数 C)。该计数器由改写器保证恒在 [0,C)：初值 i0%C，
+			   每轮 +adv 后最多 <2C，再经 `if(m>=C) m-=C` 回绕。
+			   这是**编译期可证**的不变量，因此以它作数组下标且数组长度
+			   >= C 时可以合法省略边界检查 —— 不是为性能关检查。 */
+			std::map<std::string, int64_t> mod_iv_bounds_;
+			/* ── D1: 循环级编译期证明（累加器溢出）────────────────────
+			   arr_elem_bounds_: 数组名 → **所有元素**的编译期区间。
+			     只由"定长初始化循环"静态分析得出，且一旦该函数后续
+			     还有别的数组写就整条撤销（保守）。
+			   var_init_const_: 顶层 VarDecl / 常量赋值的已知初值。
+			   active_ovf_free_var_: 仅在被证明的循环体生成期间有效，
+			     精确到「变量名 + s=s±X 形态」，循环结束即清空。 */
+			struct ArrBounds { wei_i128 lo = 0, hi = 0; bool ok = false; };
+			std::map<std::string, ArrBounds> arr_elem_bounds_;
+			std::map<std::string, int64_t> var_init_const_;
+			/* 每条 while 在函数中**之前**已被赋过值的变量集合。
+			   若累加器在其中，则它的"编译期初值"不可靠，放弃证明。 */
+			std::map<const WhileStmt*, std::set<std::string>> loop_pre_writes_;
+			/* generate() 会跑两遍（第二遍为数据重定位 patch）。两遍必须
+			   生成**逐字节一致**的代码，否则 patch 错位 → 段错误。
+			   证明结果按 (函数, trip, body 大小) 缓存，第二遍强制复用。 */
+			std::map<std::string, std::set<std::string>> acc_proof_cache_;
+			std::set<std::string> active_ovf_free_vars_;
+			bool suppress_ovf_ = false;
+			void collectArrayBounds(std::vector<Stmt>& body);
+			std::set<std::string> proveAccumNoOverflow(WhileStmt& w);
 			void noteIdxUB(const std::string& n, int64_t ub) { idx_ub_[n] = ub; }
 			void dropIdxUB(const std::string& n) { idx_ub_.erase(n); }
 			bool indexProven(const Expr& idx, int64_t len) const;
@@ -10456,6 +11534,16 @@ namespace {
 		bool addOvfFree(const Expr& lhs, int64_t c) const {
 			auto* id = std::get_if<Ident>(&lhs);
 			if (!id) return false;
+			/* D1: 取模归纳变量恒在 [0,C)，加 adv(<C) 后 < 2C。
+			   只要 2C 不超过 INT64_MAX，这次加法不可能溢出。
+			   这是编译期证明，不是为性能关检查。 */
+			{
+				auto mit = mod_iv_bounds_.find(id->name);
+				if (mit != mod_iv_bounds_.end() && mit->second > 0) {
+					wei_i128 mx = wei_i128(mit->second) + wei_i128(c > 0 ? c : -c) + 1;
+					return mx <= wei_i128(INT64_MAX);
+				}
+			}
 			auto it = idx_ub_.find(id->name);
 			if (it == idx_ub_.end()) return false;
 			int64_t ub = it->second;
@@ -10465,6 +11553,13 @@ namespace {
 			return mx <= wei_i128(INT64_MAX);
 		}
 		bool addOvfFreeVar(const std::string& nm, int64_t c) const {
+			{
+				auto mit = mod_iv_bounds_.find(nm);
+				if (mit != mod_iv_bounds_.end() && mit->second > 0) {
+					wei_i128 mx = wei_i128(mit->second) + wei_i128(c > 0 ? c : -c) + 1;
+					return mx <= wei_i128(INT64_MAX);
+				}
+			}
 			auto it = idx_ub_.find(nm);
 			if (it == idx_ub_.end()) return false;
 			int64_t ub = it->second;
@@ -10601,6 +11696,7 @@ namespace {
 			/* ── 双精度支??── */
 			std::set<std::string> dbl_vars_;                     /* 声明??double 的变量名 */
 			bool cur_ret_double_ = false;                        /* 当前函数返回 double */
+			bool cur_ret_result_ = false;                        /* 当前函数返回 Result: '?' 仅在此时合法 */
 			std::vector<std::pair<size_t, double>> dbl_patches_; /* RIP 相对双精度常量回??*/
 			/* 处理端诊断: 最近一次循环优化命中的通路名 */
 			const char* last_closed_name_ = "(none)";
@@ -10619,22 +11715,46 @@ namespace {
 			   所有会丢掉检查的变换（lea、cmov）都以静态证明为门禁。 */
 			struct Leaf { enum K { None, Imm, Reg, Mem } k = None; int reg = 0; int32_t v = 0; };
 			struct LeaTerm { Leaf l; int scale; };
-			struct Rng { wei_i128 lo = 0, hi = 0; bool ok = false; };
+			/* D1/Rust-diff: bounded = 区间本身可信（即使超出 int64）。
+			   ok 仍保持旧语义 = bounded && 整个区间落在 int64 内，
+			   专门供 ovfProven 决定"能否省略溢出检查"。
+			   新增 bounded 是为了能在区间**完全**落在合法范围之外时，
+			   于编译期直接报错（必然越界/必然溢出），而不是等运行时。 */
+			struct Rng { wei_i128 lo = 0, hi = 0; bool ok = false; bool bounded = false; };
 
 			std::map<uint32_t,int> pinned_;               /* slot -> callee-saved reg */
 			std::map<uint32_t,std::string> pinned_name_;
 			int  regOfSlot(uint32_t s) const { auto it = loop_reg_vars_.find(s); return it == loop_reg_vars_.end() ? -1 : it->second; }
 			bool pinnedActive() const { return !pinned_.empty(); }
-			bool promote_enable_ = false;   /* 寄存器驻留总开关，见 promote_function_locals 注释 */
+			bool promote_enable_ = true;    /* D1: 函数级寄存器驻留，默认开启 */
+			/* disp -> 物理寄存器。X64Buf 的 slot_hook_ 按 disp 精确查表，
+			   统一拦截所有 [rbp+d] 读写。 */
+			std::map<int64_t, int> pinnedDisp_;
+			/* generate() 跑两遍（第二遍为数据重定位 patch），两遍的驻留决策
+			   必须逐字节一致。第二遍复用第一遍的 slot→reg 映射。 */
+			/* 两遍按**调用顺序**对齐，不用 key —— 同名/同体大小的函数
+			   用 key 会串味，顺序对齐严格保证 pass2 复用 pass1 的决策。 */
+			std::vector<std::vector<std::pair<uint32_t,int>>> promote_seq_;
+			size_t promote_seq_idx_ = 0;
 			void clearLoopRegs() { for (auto it = loop_reg_vars_.begin(); it != loop_reg_vars_.end();) { if (pinned_.count(it->first)) ++it; else it = loop_reg_vars_.erase(it); } }
 			void promote_function_locals(FuncDecl& f);
 			void emit_sync_pinned(bool toMem, const std::function<bool(uint32_t)>& want);
 			void emit_load_var(const std::string& nm);
 			void emit_store_var(const std::string& nm);
+			/* D1: 输出/外部调用 stub 会用 r15 暂存栈指针并 clobber 临时寄存器。
+			   进入 stub 前把驻留值写回内存、禁用 hook，之后全走内存 ——
+			   这是标准编译器的 call-clobber spill 处理，正确性优先。
+			   典型程序的输出在末尾，循环体全程仍享受寄存器驻留。 */
+			void spill_and_drop_pinned();
 			Leaf leafOf(Expr& e);
 			Rng  rngOf(const Expr& e);
 			Rng  rngOfBin(const Binary& b);
 			bool ovfProven(Binary& n);
+			bool mustOverflow(const Expr& e);                    /* 区间完全超出 int64 → 必然溢出 */
+			bool mustBeOOB(const Expr& idx, int64_t len);         /* 区间完全落在 [0,len) 之外 → 必然越界 */
+			void checkProvenOOB(const IndexExpr& n, int64_t len);
+			void checkProvenOverflow(const Binary& n);
+			void proofNote(const char* what, int line);
 			bool specExpr(Expr& e);
 			bool isBoolValued(const Expr& e) const;
 			void emit_norm_bool();
@@ -10647,12 +11767,31 @@ namespace {
 			bool try_bool_branchless(Binary& n);
 			bool try_cmov_if(IfStmt& n);
 			int  emit_cmp_flags(Expr& cond);
+			/* ── 编译期「对 2 的幂取模后判零」压成位测试 ──────────────────
+			   C 语义里余数符号跟随被除数，但「余数是否为 0」与符号无关：
+			     x % 2^k == 0   ⟺   (x & (2^k-1)) == 0
+			     x % 2^k != 0   ⟺   (x & (2^k-1)) != 0
+			   对**任意有符号 x**（含负数、INT64_MIN）都成立，因此不需要
+			   非负证明，是纯语义等价变换，零正确性风险。
+
+			   原路径 x%2 会走 emit_divmod_const 的 magic-multiply 序列：
+			   sar $63 / and / add / and / sub / sete / movzbq / cmp / jcc，
+			   约 17 条指令，且每个内层循环迭代都要跑一遍。
+			   压成 `gen(x) + test $mask,%rax + jcc` 后约 2~3 条。
+
+			   Rust / gcc 都不会把「取模结果只用于与 0 比较」跨过有符号
+			   取模的语义边界合成 test —— 它们保留通用取模，再比较。 */
+			bool modpow2_test(Expr& cmpL, Expr& cmpR, const std::string& cmpOp,
+			                  Expr** valExpr, int64_t* mask, int* cc);
+			bool try_modpow2_flags(Expr& cond, int& ccOut);
+			bool try_modpow2_value(Binary& n);
 			bool emit_while_rotated(WhileStmt& n);
 			bool emit_for_rotated(ForStmt& n);
 			static bool deepHasJump(const std::vector<Stmt>& v);
 
 			void gen_stmt(Stmt& s);
 			void gen_expr(Expr& e);
+			void gen_expr_inner(Expr& e);   /* gen_expr 去掉 '?' 展开后的本体 */
 			bool is_builtin_call(const std::string& name) const;
 			void gen_builtin_call(Call& n);
 			void emit_udivmod128_stub();
@@ -12517,8 +13656,10 @@ struct LoopOptimizer {
 		if (auto* ix = std::get_if<IndexExpr>(&e)) {
 			auto& vi = resolve_var(ix->name);
 			if (vi.array_len > 0) {
+				checkProvenOOB(*ix, vi.array_len);   /* 编译期证明必然越界 → 直接报错 */
 				gen_expr(*ix->idx);
-				if (!(ix->idx && indexProven(*ix->idx, vi.array_len))) emit_bounds_check(vi.array_len);
+				if (ix->idx && indexProven(*ix->idx, vi.array_len)) proofNote("数组下标在界内", ix->line);
+				else emit_bounds_check(vi.array_len);
 				c_.push_r(0);
 				c_.mov64r_imm64(1, 8);
 				c_.imul_r64_rm64(0, 1);          /* rax = idx*8 */
@@ -13098,6 +14239,10 @@ struct LoopOptimizer {
 	   因此必须在执行前拦截。被除数须已在 RAX，除数为 divisor_reg。本序列只
 	   借 RDX 作临时寄存器——随后的 CQO 本就会覆盖 RDX，故不破坏任何活跃值。 */
 	void NativeGen::emit_ovf_check() {
+		/* D1: 编译期已证明该赋值不可能溢出（见 proveAccumNoOverflow）。
+		   这是"证明不需要检查"，不是"为性能关检查" —— 触发条件严格到
+		   只覆盖单个循环内、单个变量、单种赋值形态。 */
+		if (suppress_ovf_) return;
 		/* C3: 分级开关 —— none/min 下省略溢出检查（不是偷偷关，是用户显式选的等级） */
 		if (!check_enabled(CheckKind::Overflow)) return;
 		/* -wide 的语义就是"越界也继续算": 64 位溢出检查在这里全部失效,
@@ -13536,7 +14681,7 @@ struct LoopOptimizer {
 			}
 			gen_expr(*n.args[0]);
 			c_.mov64r_rm64(1, 0);              /* rcx = exit code */
-			c_.save_rsp_r15();
+		c_.save_rsp_r15();
 			c_.align_rsp16();
 			size_t call_pos = c_.call_rip();   /* 返回 disp32 字段位置 */
 			pe_iat_patches_.push_back({call_pos, 1});
@@ -13557,7 +14702,7 @@ struct LoopOptimizer {
 				throw std::runtime_error("运行时函数 " + n.callee + " 参数数量错误 at " + std::to_string(n.line) + ":" + std::to_string(n.col));
 			}
 			int total = 32;
-			c_.save_rsp_r15();
+		c_.save_rsp_r15();
 			c_.align_rsp16();
 			c_.sub_rsp(total);
 			for (size_t i = 0; i < n.args.size(); i++) {
@@ -13606,7 +14751,7 @@ struct LoopOptimizer {
 				throw std::runtime_error("运行时函数 " + n.callee + " 参数数量错误 at " + std::to_string(n.line) + ":" + std::to_string(n.col));
 			}
 			int total = static_cast<int>((std::max<size_t>(32, n.args.size() * 8) + 15) & ~size_t(15));
-			c_.save_rsp_r15();
+		c_.save_rsp_r15();
 			c_.align_rsp16();
 			c_.sub_rsp(total);
 			for (size_t i = 0; i < n.args.size(); i++) {
@@ -14335,6 +15480,13 @@ bool NativeGen::gen_binary_wide(Binary& n) {
 bool NativeGen::indexProven(const Expr& idx, int64_t len) const {
 	auto* id = std::get_if<Ident>(&idx);
 	if (!id) return false;
+	/* D1: 取模归纳变量的计数器恒在 [0, C)（见 mod_iv_bounds_ 注释）。
+	   数组长度 >= C 时，越界在编译期已不可能，可以合法省略运行时检查。 */
+	{
+		auto mit = mod_iv_bounds_.find(id->name);
+		if (mit != mod_iv_bounds_.end() && mit->second > 0 && mit->second <= len)
+			return true;
+	}
 	auto it = idx_ub_.find(id->name);
 	if (it == idx_ub_.end()) return false;
 	if (it->second <= 0) return false;
@@ -14604,6 +15756,87 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 }
 
 	void NativeGen::gen_expr(Expr& e) {
+		/* ── '?' 错误传播（Rust 的 ? 操作符）─────────────────────────────
+		   f()? 展开为: 调用 f 得到 rax → 若 rax < 0（Err）则当前函数立即
+		   以该错误码返回；否则 rax 即 Ok 值，继续往下走。
+		   在这里统一处理，赋值/声明/表达式语句等各种位置都能覆盖。
+		   实现要点: 临时清掉 has_try 再递归，否则会无限展开。 */
+		if (auto* cl = std::get_if<Call>(&e)) {
+			if (cl->has_try) {
+				/* Rust 的核心约束: '?' 只能在返回 Result 的函数里使用。
+				   否则错误码无处可去，会被静默吞掉 —— 这正是 C 忽略返回值
+				   的老毛病，必须在编译期拦住。 */
+				if (!cur_ret_result_) {
+					wei::diag::Diagnostic d;
+					d.sev = wei::diag::Severity::Error;
+					d.code = "E0277";
+					d.message = "'?' 只能在返回 Result 的函数中使用";
+					int t_line = cl->try_line > 0 ? cl->try_line : cl->line;
+					int t_col  = cl->try_col  > 0 ? cl->try_col  : cl->col;
+					d.labels.push_back({{t_line, t_col, 1}, "这个 '?' 无处传播错误", true});
+					d.help("把当前函数改为返回 .Result，或改用显式判断返回值是否 < 0");
+					d.help("运行 mtg explain E0277 查看完整说明与可编译的修复示例");
+					throw wei::diag::DiagnosticError(d);
+				}
+				cl->has_try = false;
+				gen_expr_inner(e);
+				cl->has_try = true;
+				c_.test_rm64_r64(0, 0);
+				int j_ok = emit_jcc(0x9);          /* jns: rax >= 0 为 Ok */
+
+				/* ── 自动错误传播链（相对 Rust 的增量）───────────────────
+				   Rust 的 '?' 只把 Err 原样上抛，想知道经过哪些调用点得靠
+				   anyhow + RUST_BACKTRACE。这里在**编译期**把每个 '?' 的
+				   源文件、行列、所在函数与被调函数写进字符串池，Err 分支
+				   顺手打印一行；多层 '?' 自然形成由内向外的完整链路，
+				   零第三方依赖。-no-error-trace 可完全关闭（零指令开销）。
+				   printf/write 会冲掉 RAX，先把负错误码压栈保护。 */
+				if (wei::diag::errorTraceFlag()) {
+					c_.push_r(0);
+					std::string src = dbg_src_file_.empty() ? std::string("<input>") : dbg_src_file_;
+					for (char& ch : src) if (ch == '\\') ch = '/';   /* 路径分隔符统一为 / */
+					std::string site = "[错误传播] " + src + ":"
+					    + std::to_string(cl->try_line > 0 ? cl->try_line : cl->line) + ":"
+					    + std::to_string(cl->try_col  > 0 ? cl->try_col  : cl->col)
+					    + "  " + (cur_qualname_.empty() ? std::string("<fn>") : cur_qualname_)
+					    + "  " + cl->callee + "()?";
+					wei::ast::Output out;
+					out.line = cl->line;
+					out.col = cl->col;
+					auto sv = std::make_unique<wei::ast::Expr>();
+					wei::ast::StrLit lit;
+					lit.value = site;
+					*sv = std::move(lit);
+					out.values.push_back(std::move(sv));
+					wei::ast::Expr outExpr = std::move(out);
+					gen_expr_inner(outExpr);   /* 复用 do.emit:: 的字符串输出链路 */
+					c_.pop_r(0);               /* RAX 恢复为负错误码 */
+				}
+
+				/* Main::main 的 '?' 直接以错误码绝对值结束进程。入口桩对
+				   .Result 的返回值传递不可靠（实测退出码恒为 0，错误被静默
+				   吞掉），这里绕开它交给 ExitProcess。rustc 的 main->Result
+				   只打印 Debug 表示，这里还附带整条传播链。 */
+				if (target_ && std::string(target_->id()) == "win64"
+				    && cur_qualname_.rfind("Main::main", 0) == 0) {
+					c_.u8(0x48); c_.u8(0xF7); c_.u8(0xD8);   /* neg rax: -7 -> 7 */
+					c_.mov64r_rm64(1, 0);                      /* rcx = 错误码 */
+					c_.save_rsp_r15();
+					c_.align_rsp16();
+					size_t cp = c_.call_rip();                  /* ExitProcess */
+					pe_iat_patches_.push_back({cp, 1});
+					c_.u8(0xCC);
+				} else {
+					emit_return_epilogue();    /* rax 已是负错误码 */
+				}
+				patch(j_ok);
+				return;
+			}
+		}
+		gen_expr_inner(e);
+	}
+
+	void NativeGen::gen_expr_inner(Expr& e) {
 		/* C1 位宽: 若整个表达式是 i32，则本次求值全程走 32 位通路。
 		   子表达式继承该模式 —— 保证运算对象宽度一致，不会出现
 		   "一半 64 位一半 32 位"的错位。退出时恢复。 */
@@ -14713,6 +15946,9 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 				self->known_const_.clear();
 			}
 			void operator()(Binary& n) {
+				/* 编译期证明「必然溢出」→ 直接报错，不等运行时、更不静默回绕。
+				   对标 Rust release 的默认 wrapping 行为。 */
+				self->checkProvenOverflow(n);
 				const std::string& op = n.op;
 				/* 无分支 && / ||: 两侧可安全推测时，一条 and/or 取代两次跳转 */
 				static const bool cq = getenv("WEI_NO_CQ") == nullptr;   /* A/B 测量用 */
@@ -14927,6 +16163,8 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 						}
 					}
 				}
+				/* ── 编译期 %2^k 判零 → 位测试（表达式值版本）── */
+				if (self->try_modpow2_value(n)) return;
 				/* double 比较: ucomisd 路径 */
 				if ((op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=")
 				        && (self->isDblExpr(n.lhs) || self->isDblExpr(n.rhs))) {
@@ -15042,6 +16280,42 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 						dc = dp->value;
 						dc_ok = (dc != 0 && dc != -1);
 					}
+					/* ── D1: x / 2^k 强度削减（4 条指令，16 条 → 4 条）───
+					   C 语义的有符号除法是「向零取整」，等价于：
+					     x / 2^k = (x + ((x>>63) & (2^k-1))) >> k   (算术右移)
+					   · x ≥ 0: x>>63=0 → 直接 sar，即 floor = trunc ✓
+					   · x < 0: x>>63=-1 → 加 (2^k-1) 后 sar，即 ceil =
+					     trunc toward zero ✓（实测 -5/2=-2, -7/4=-1）
+					   · INT64_MIN: 加正数不会溢出，sar 后得 INT64_MIN/2^k ✓
+					   除数是编译期常量且 >0，除零与 INT64_MIN/-1 两种 #DE
+					   在编译期即可排除，不需要任何运行时检查。
+					   也没有 idiv —— 20~40 周期的硬件除法彻底消失。
+
+					   保守闸门（不牺牲任何语义）：
+					   · 只在 op=="/" 且 dc 为正的 2 的幂
+					   · lhs 必须是普通 int 局部/全局标识符（排除无符号、
+					     窄宽度、double、复杂表达式）
+					   · i32_mode_ / wide_mode_ 走原路径
+					   · WEI_NO_DIVPOW2=1 可整体关闭做 A/B */
+					static bool noDivPow2 = getenv("WEI_NO_DIVPOW2") != nullptr;
+					if (!noDivPow2 && dc_ok && op == "/" && dc > 1
+					        && dc <= (1LL << 30) && (dc & (dc - 1)) == 0
+					        && !self->i32_mode_ && !self->wide_mode_
+					        && !self->isDblExpr(n.lhs) && self->widthOfExpr(*n.lhs) == 0) {
+						if (auto* lid = std::get_if<Ident>(n.lhs.get())) {
+							if (!self->unsignedOfVar(lid->name) && self->widthOfVar(lid->name) == 0) {
+								int k = 0;
+								for (int64_t t = dc; t > 1; t >>= 1) k++;
+								/* rax = x（已由通用路径求值）；rcx = 常数除数 */
+								self->c_.cqo();                                  /* rdx = x>>63 符号掩码 */
+								self->c_.alu_rm64_imm32(2, 4, static_cast<int32_t>(dc - 1)); /* and rdx, 2^k-1 */
+								self->c_.add_r64_rm64(0, 2);                     /* rax += (sign & mask) */
+								self->c_.sar_rm64_imm8(0, static_cast<uint8_t>(k)); /* 算术右移 k */
+								self->proofNote("x/2^k 强度削减(4 指令，向零取整)", n.line);
+								return;
+							}
+						}
+					}
 					if (dc_ok) {
 						self->emit_divmod_const(dc, op == "%");
 					} else {
@@ -15128,6 +16402,19 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 				}
 			}
 			void operator()(Call& n) {
+				/* ── Result 构造 ──────────────────────────────────────────
+				   ok(v): rax = v          (v 应 >= 0，非负即为成功值)
+				   err(e): rax = -e        (负数即错误码)
+				   放在最前: is_builtin_call 之前，避免被当作未知内置函数。 */
+				if (n.callee == "ok" && n.args.size() == 1) {
+					self->gen_expr(*n.args[0]);
+					return;
+				}
+				if (n.callee == "err" && n.args.size() == 1) {
+					self->gen_expr(*n.args[0]);
+					self->c_.neg_rm64(0);                    /* rax = -错误码 */
+					return;
+				}
 				if (self->is_builtin_call(n.callee)) {
 					self->gen_builtin_call(n);
 					return;
@@ -15210,11 +16497,13 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 			void operator()(IndexExpr& n) {
 				auto& vi = self->resolve_var(n.name);
 				if (vi.array_len > 0) {
+					self->checkProvenOOB(n, vi.array_len);   /* 编译期证明必然越界 → 直接报错 */
 					/* 静态证明索引必然在界内 → 省略运行时检查。
 					   省掉的是每次访问的 cmp + 分支，在数组密集的循环里
 					   这是实打实的收益；同时**没有**牺牲任何安全性，
 					   因为不变量是在编译期证明过的。 */
 					bool proven = n.idx && self->indexProven(*n.idx, vi.array_len);
+					if (proven) self->proofNote("数组下标在界内", n.line);
 					self->gen_expr(*n.idx);
 					if (!proven) self->emit_bounds_check(vi.array_len);
 					/* ── 定长数组取元素: 用一条带 SIB(scale=8) 的 mov 直达 ──
@@ -15473,6 +16762,29 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 				self->c_.u32(static_cast<uint32_t>(d));
 			}
 			void operator()(AssignStmt& n) {
+				/* ── D1: 编译期证明「本循环内该累加器不可能溢出」──────
+				   仅当: ① 当前处于被证明的循环体内
+				        ② 变量名精确匹配
+				        ③ 赋值形态恰为 s = s ± X（X 已由区间分析证明有界）
+				   才在**本条语句生成期间**抑制 emit_ovf_check。
+				   循环体内其它赋值（j=j+1 等）不受影响，检查照常。 */
+				bool ovfProvenHere = false;
+				if (self->active_ovf_free_vars_.count(n.name) && !n.target && n.value) {
+					if (auto* b = std::get_if<Binary>(n.value.get())) {
+						if (b->op == "+" || b->op == "-") {
+							if (auto* l = std::get_if<Ident>(b->lhs.get()))
+								ovfProvenHere = (l->name == n.name);
+						}
+					}
+				}
+				struct OvfGuard {
+					NativeGen* g; bool old; bool on;
+					OvfGuard(NativeGen* g_, bool on_) : g(g_), old(g_->suppress_ovf_), on(on_) {
+						if (on) g->suppress_ovf_ = true;
+					}
+					~OvfGuard() { if (on) g->suppress_ovf_ = old; }
+				} ovfGuard(self, ovfProvenHere);
+
 				/* ── IR 路径（-ir）─────────────────────────────────────────
 				   先把表达式线性化成三地址码，在 IR 上跑优化 pass，
 				   再经线性扫描寄存器分配发射。命中则直接返回；
@@ -15946,6 +17258,74 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 				self->patch(jfail);
 			}
 			void operator()(IfStmt& n) {
+				/* ── D1: 取模计数器回绕的紧凑发射 ──────────────────────
+				   不用 AST 标记（generate() 会跑两遍、AST 可能被重建，
+				   标记会丢），而是**形态识别 + 编译期凭证**：
+
+				   形态: if (m >= C) { m = m - C; }，else 为空。
+				   凭证: m 必须在 mod_iv_bounds_ 里由改写器显式登记，
+				         且登记的模数必须等于此处的 C。
+				   该登记意味着编译期已证明 m 恒在 [0,C)：初值 i0%C，
+				   每轮 +adv(<C) 后最多 <2C，再经本回绕减 C。故减法
+				   不可能溢出 —— 省略检查是证明的结果，不是关检查。
+
+				   用户手写的同形态 if 只要没被登记过，一律走通用路径，
+				   不会被误认，也不会丢掉任何运行时检测。 */
+				{
+					bool wrap = false;
+					int64_t C = 0;
+					std::string nm;
+					if (n.else_body.empty() && n.then_body.size() == 1 && n.cond) {
+						if (auto* cb = std::get_if<Binary>(n.cond.get())) {
+							if (cb->op == ">=") {
+								auto* cid = std::get_if<Ident>(cb->lhs.get());
+								auto* cil = std::get_if<IntLit>(cb->rhs.get());
+								auto* as = std::get_if<AssignStmt>(&n.then_body[0]);
+								if (cid && cil && as && !as->target && as->name == cid->name
+								    && cil->value >= 1 && cil->value <= INT32_MAX) {
+									if (auto* ab = std::get_if<Binary>(as->value.get())) {
+										auto* al = std::get_if<Ident>(ab->lhs.get());
+										auto* ar = std::get_if<IntLit>(ab->rhs.get());
+										if (ab->op == "-" && al && ar && al->name == cid->name
+										    && ar->value == cil->value) {
+											auto mit = self->mod_iv_bounds_.find(cid->name);
+											if (mit != self->mod_iv_bounds_.end()
+											    && mit->second == cil->value) {
+												wrap = true; C = cil->value; nm = cid->name;
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+					if (wrap) {
+						auto& vi = self->resolve_var(nm);
+						int32_t Ci = static_cast<int32_t>(C);
+						int r = vi.is_local ? self->regOfSlot(vi.slot) : -1;
+						if (r >= 0) {
+							self->c_.cmp_rm64_imm32(r, Ci);
+							int jskip = self->emit_jcc(0x2);       /* jb skip */
+							self->c_.sub_rm64_imm32(r, Ci);
+							self->patch(jskip);
+						} else if (vi.is_local) {
+							int32_t d = static_cast<int32_t>(-8 * static_cast<int>(vi.slot + 1));
+							self->c_.mov64r_memd8(0, 5, d);
+							self->c_.cmp_rm64_imm32(0, Ci);
+							int jskip = self->emit_jcc(0x2);
+							self->c_.sub_rm64_imm32(0, Ci);
+							self->c_.mov_memd8_64r(5, d, 0);
+							self->patch(jskip);
+						} else wrap = false;
+						if (wrap) {
+							self->last_store_len_ = (size_t) -1;
+							self->last_store_slot_ = -1;
+							self->known_const_.erase(nm);
+							self->proofNote("取模计数器回绕不溢出", n.line);
+							return;
+						}
+					}
+				}
 				if (auto* bl = std::get_if<BoolLit>(n.cond.get())) {
 					if (bl->value) {
 						if (!n.then_body.empty()) {
@@ -15972,9 +17352,21 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 					self->last_store_len_ = (size_t) -1;
 					return;
 				}
-				self->gen_expr(*n.cond);
-				self->c_.cmp_rm64_imm32(0, 0);
-				int jmp_else = self->emit_jcc(0x4);
+				/* ── D1: 条件直接产生 flags，不把结果 materialize 成 0/1 ──
+				   原路径: gen_expr(cond) → cmp $0 → je，其中比较表达式
+				   内部已 setcc+movzbq，共 4 条冗余指令。
+				   emit_cmp_flags 对比较直接 cmp+反向 jcc，对 %2^k 判零
+				   直接 test+jcc；对一般 cond 仍等价于 gen_expr+test+jne。 */
+				static bool noCmpFlags = getenv("WEI_NO_CMPFLAGS") != nullptr;  /* A/B */
+				int condCC;
+				if (noCmpFlags) {
+					self->gen_expr(*n.cond);
+					self->c_.cmp_rm64_imm32(0, 0);
+					condCC = 0x5;
+				} else {
+					condCC = self->emit_cmp_flags(*n.cond);
+				}
+				int jmp_else = self->emit_jcc(weiJccNegate(condCC));
 				if (!n.then_body.empty())
 					self->gen_block(n.then_body);
 				if (!n.else_body.empty()) {
@@ -16468,13 +17860,27 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 				   且它们不在通用表达式求值的临时寄存器集合里
 				   （那套用的是 rax/rcx/rdx/r8-r11），
 				   因此跨越除法、比较、运行时调用都不会被破坏。 */
-				static const int regs[4] = {3, 12, 13, 14};  /* rbx, r12, r13, r14 */
+				/* D1: 与函数级驻留动态互斥。
+				   pinned 池是 {r14,r15,r12}，循环提升原池是 {rbx,r12,r13,r14}，
+				   两者重叠 r12/r14 —— 同一物理寄存器被两个变量占用会互相覆盖，
+				   实测 Collatz 嵌套循环直接死循环。
+				   ① 池里剔除 pinned 已占用的物理寄存器
+				   ② 已被 pinned 驻留的 slot 不再提升（hook 已处理它的读写） */
+				std::vector<int> avail;
+				{
+					std::set<int> taken;
+					for (auto& kv : self->pinned_) taken.insert(kv.second);
+					for (int r : {3, 12, 13, 14}) if (!taken.count(r)) avail.push_back(r);
+				}
 				self->last_store_len_ = (size_t) -1;
-				for (size_t i = 0; i < cand.size(); i++) {
+				size_t ri = 0;
+				for (size_t i = 0; i < cand.size() && ri < avail.size(); i++) {
 					auto& vi = self->resolve_var(cand[i]);
+					if (self->pinned_.count(vi.slot)) continue;
 					int32_t rd = static_cast<int32_t>(-8 * static_cast<int>(vi.slot + 1));
-					self->c_.mov64r_memd8(regs[i], 5, rd);
-					self->loop_reg_vars_[vi.slot] = regs[i];
+					self->c_.mov64r_memd8(avail[ri], 5, rd);
+					self->loop_reg_vars_[vi.slot] = avail[ri];
+					ri++;
 				}
 				size_t start = self->c_.pos();
 				int jmp_exit = 0;
@@ -16513,6 +17919,18 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 			}
 			void operator()(WhileStmt& n) {
 				self->last_store_len_ = (size_t) -1;
+				/* ── D1: 循环级累加器溢出证明 ─────────────────────────
+				   证明成功返回被豁免的累加器变量名，作用域严格限定在
+				   **本条 while 的整个生成期间**（含所有优化分支），
+				   退出即恢复，不会泄漏到循环外或别的循环。 */
+				auto provedAcc = self->proveAccumNoOverflow(n);
+				struct AccGuard {
+					NativeGen* g; std::set<std::string> old;
+					AccGuard(NativeGen* g_, const std::set<std::string>& v) : g(g_), old(g_->active_ovf_free_vars_) {
+						for (auto& x : v) g->active_ovf_free_vars_.insert(x);
+					}
+					~AccGuard() { g->active_ovf_free_vars_ = old; }
+				} accGuard(self, provedAcc);
 				/* ── 边界检查消除的准备 ──
 				   从 `while (i < X)` 推出 i 的上界。
 				   X 可以是字面量，**也可以是常量传播已知的变量**
@@ -16565,6 +17983,14 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 				else if (self->try_gcd_loop(n)) return;
 				/* 宽算术模式下跳过闭式解与寄存器驻留: 它们按 64 位公式直接
 				   写结果槽，不会更新影子高位槽，开 -wide 反而会算错。 */
+				/* WEI_TRACE_LOOP=1 打印每个 while 命中的优化路径。
+				   用于定位"变量为何仍走栈槽"这类性能问题 —— 光看耗时
+				   猜不出是哪条路径，必须能看到分派结果。 */
+				static bool trace_loop = getenv("WEI_TRACE_LOOP") != nullptr;
+				auto hit = [&](const char* nm) -> bool {
+					if (trace_loop) fprintf(stderr, "[loop] line %d -> %s\n", n.line, nm);
+					return true;
+				};
 				if (self->wide_mode_) { /* fallthrough to generic path */ }
 				else
 				/* 闭式解分类: 交给独立模块 LoopOptimizer 调度
@@ -16573,17 +17999,18 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 				   属于算法级替换，是 -no-opt 要关闭的部分。 */
 				/* 处理端分层: 语义层闭式解永远生效（语言语义要求），
 				   优化层（SIMD 向量化等）才受 -no-opt 控制。 */
-				if (!self->bodyHasJump(n.body) && LoopOptimizer::runSemantic(*self, n)) return;
-				if (self->opt_ && !self->bodyHasJump(n.body) && LoopOptimizer::runOpt(*self, n)) return;
+				if (!self->bodyHasJump(n.body) && LoopOptimizer::runSemantic(*self, n)) { hit("semantic_closed_form"); return; }
+				if (self->opt_ && !self->bodyHasJump(n.body) && LoopOptimizer::runOpt(*self, n)) { hit("opt_simd"); return; }
 				/* U=4 展开 + 归纳变量。属于"代码质量"层，no-opt 下同样启用
 				   —— 它不改变算法复杂度，只是把每轮要做的事压缩得更紧。 */
-				if (try_while_unroll4(n)) return;
-				if (try_while_iv_opt(n)) return;
-				if (try_while_promote(n)) return;
-				if (try_while_fast_cond(n)) return;
+				if (try_while_unroll4(n)) { hit("unroll4"); return; }
+				if (try_while_iv_opt(n)) { hit("iv_opt"); return; }
+				if (try_while_promote(n)) { hit("PROMOTE_REG"); return; }
+				if (try_while_fast_cond(n)) { hit("fast_cond"); return; }
 				/* 循环旋转: 顶部测试循环每轮 2 次分支（条件跳 + 回跳），
 				   旋转后每轮只有 1 次向后分支。无 break/continue 才能做。 */
-				if (self->emit_while_rotated(n)) return;
+				if (self->emit_while_rotated(n)) { hit("rotated"); return; }
+				hit("GENERIC_STACK_SLOTS");
 				size_t start = self->c_.pos();
 				self->brk_.emplace_back();
 				self->cont_.push_back(start);
@@ -16794,13 +18221,21 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 								/* 同 WhileStmt 提升路径: 避开 rdx/r9 ——
 								   除法与取模会覆写 rdx, 用它做提升寄存器会让
 								   循环体里的 `%` `/` 把变量冲掉, 造成死循环。 */
-								static const int regs2[2] = {3, 12};  /* rbx, r12 */
-								for (size_t i = 0; i < cand.size(); i++) {
+								/* D1: 同上，避开 pinned 占用的物理寄存器与 slot */
+								std::vector<int> avail2;
+								{
+									std::set<int> taken2;
+									for (auto& kv : self->pinned_) taken2.insert(kv.second);
+									for (int r : {3, 12}) if (!taken2.count(r)) avail2.push_back(r);
+								}
+								size_t ri2 = 0;
+								for (size_t i = 0; i < cand.size() && ri2 < avail2.size(); i++) {
 									auto& rvi = self->resolve_var(cand[i]);
-									if (rvi.is_local) {
+									if (rvi.is_local && !self->pinned_.count(rvi.slot)) {
 										int32_t rd = static_cast<int32_t>(-8 * static_cast<int>(rvi.slot + 1));
-										self->c_.mov64r_memd8(regs2[i], 5, rd);
-										self->loop_reg_vars_[rvi.slot] = regs2[i];
+										self->c_.mov64r_memd8(avail2[ri2], 5, rd);
+										self->loop_reg_vars_[rvi.slot] = avail2[ri2];
+										ri2++;
 									}
 								}
 							}
@@ -17349,6 +18784,16 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 	   寄存器）、裸指针解引用 *p、取地址 &x、函数调用、以及下标本身
 	   还嵌着内存访问的形态。 */
 	bool NativeGen::expr_has_mem_promotable(Expr& e) {
+		/* D1 阶段 0: 这个函数名义上叫"放宽版: 允许读局部数组"，
+		   但原来只特判了**顶层**就是 IndexExpr 的情况。
+		   真实的数组累加循环写的是 `s = s + arr[j]` —— 顶层是 Binary，
+		   于是直接落到 expr_has_mem()，递归撞见嵌套的 IndexExpr 就返回 true，
+		   整个循环被 try_while_promote 拒绝，变量依旧全走栈槽。
+		   这正是 b4_arr / 数组密集循环慢于 C 2~3 倍的直接原因。
+
+		   改为递归: 对 Binary/Unary 的每个子节点调用**本函数**而不是
+		   expr_has_mem()，这样局部数组读依旧放行、全局数组读与其它
+		   不安全的内存形态依旧拒绝。 */
 		if (auto* ix = std::get_if<IndexExpr>(&e)) {
 			auto& vi = resolve_var(ix->name);
 			if (!vi.is_local || vi.array_len <= 0) return true;   /* 全局数组: 拒绝 */
@@ -17358,7 +18803,16 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 			if (expr_has_mem(*ix->idx)) return true;
 			return false;
 		}
-		return expr_has_mem(e);
+		if (auto* b = std::get_if<Binary>(&e)) {
+			return (b->lhs && expr_has_mem_promotable(*b->lhs))
+			    || (b->rhs && expr_has_mem_promotable(*b->rhs));
+		}
+		if (auto* u = std::get_if<Unary>(&e)) {
+			if (u->op == "*" || u->op == "&") return true;       /* 指针解引用: 拒绝 */
+			return u->operand && expr_has_mem_promotable(*u->operand);
+		}
+		if (std::holds_alternative<Call>(e)) return true;
+		return expr_has_mem(e);                                  /* 其余形态保守拒绝 */
 	}
 
 	bool NativeGen::expr_has_mem(Expr& e) {
@@ -17828,6 +19282,10 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 				ws->body.push_back(Stmt(std::move(ifs)));
 			}
 
+			/* 登记编译期可证的上界，供 indexProven 省略边界检查。
+			   只在 adv != 0 的完整改写路径登记（cnt>0 已确认）。 */
+			mod_iv_bounds_[tmp] = C;
+
 			/* 3) 循环前插入 m 的初值声明。
 			   插在 body[idx] 之前 —— 走 AST 而不是代码生成期分配槽位,
 			   这样 ScanVars 会把它算进栈帧。 */
@@ -17843,6 +19301,358 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 				idx++;      /* 跳过刚插入的声明 */
 			}
 		}
+	}
+
+
+	/* ══════════════════════════════════════════════════════════════════
+	   D1 · 循环级编译期证明：定长数组区间 + 累加器不可能溢出
+	   ══════════════════════════════════════════════════════════════════
+	   目标: `while (j<N) { s = s + arr[m]; ... }` 里 s 的 jo 检查每轮一次。
+	   若能编译期证明「s 在整个循环里绝不可能溢出」，就合法省略它 ——
+	   这是证明的结果，不是把检查关掉凑性能。
+
+	   证明链:
+	     ① 数组元素区间 arr_elem_bounds_ 来自定长初始化循环的静态分析
+	     ② 迭代次数上界 trip = N - iv0（N/iv0 都是编译期常量）
+	     ③ 累加器初值 s0 是编译期常量
+	     ④ |s0| + trip * max(|X.lo|,|X.hi|) <= INT64_MAX
+	   任一环证不出 → 保留运行时检查，绝不静默豁免。
+
+	   保守闸门（宁可证不出，不可误证）:
+	     · 数组在区间登记后若函数中还有别的写，整条撤销
+	     · 归纳变量只能被 `iv = iv + 正常量` 推进（否则 trip 上界失效）
+	     · 循环体不含调用/输入/输出/数组写等副作用
+	     · 累加器在循环体内只被这一条赋值写
+	   ══════════════════════════════════════════════════════════════════ */
+
+	/* 三态: 0=确定不写该数组, 1=确定写, 2=遇到无法判定的结构 */
+	static int weiArrayWrites(const Stmt& st, const std::string& arr) {
+		int r = 0;
+		auto rec = [&](const std::vector<Stmt>& v) {
+			for (auto& x : v) { int q = weiArrayWrites(x, arr); if (q > r) r = q; }
+		};
+		std::visit([&](const auto& n) {
+			using T = std::decay_t<decltype(n)>;
+			if constexpr (std::is_same_v<T, AssignStmt>) {
+				if (n.target) {
+					if (auto* ix = std::get_if<IndexExpr>(n.target.get())) {
+						if (ix->name == arr) r = 1;
+					} else r = 2;                       /* 指针写: 无法判定 */
+				}
+			}
+			else if constexpr (std::is_same_v<T, Block>) rec(n.stmts);
+			else if constexpr (std::is_same_v<T, IfStmt>) { rec(n.then_body); rec(n.else_body); }
+			else if constexpr (std::is_same_v<T, WhileStmt> || std::is_same_v<T, ForStmt>
+			                   || std::is_same_v<T, LoopStmt> || std::is_same_v<T, LoopNStmt>
+			                   || std::is_same_v<T, CompileTimeStmt> || std::is_same_v<T, ForallStmt>)
+				rec(n.body);
+			else if constexpr (std::is_same_v<T, WhenStmt>) { rec(n.then_body); rec(n.else_body); }
+			else if constexpr (std::is_same_v<T, SwitchStmt>) {
+				for (auto& c : n.cases) rec(c.body.stmts);
+			}
+			else if constexpr (std::is_same_v<T, MatchStmt>) {
+				for (auto& c : n.cases) rec(c.body);
+				rec(n.default_body);
+			}
+			else if constexpr (std::is_same_v<T, DeferStmt>) rec(n.body.stmts);
+			else if constexpr (std::is_same_v<T, ReturnStmt> || std::is_same_v<T, ExprStmt>
+			                   || std::is_same_v<T, VarDecl> || std::is_same_v<T, ModuleAccessSet>
+			                   || std::is_same_v<T, ContractStmt> || std::is_same_v<T, TypeAliasDecl>
+			                   || std::is_same_v<T, YieldStmt> || std::is_same_v<T, MacroDecl>
+			                   || std::is_same_v<T, BreakStmt> || std::is_same_v<T, ContinueStmt>) {
+				/* 这些形态不产生数组写 */
+			}
+			else r = 2;                                 /* AsmStmt 等: 无法判定 */
+		}, st);
+		return r;
+	}
+
+	/* 表达式里是否含调用/输入/输出等副作用（保守: 认不出的形态也拒绝） */
+	static bool weiExprPure(const Expr& e) {
+		bool bad = false;
+		std::visit([&](const auto& n) {
+			using T = std::decay_t<decltype(n)>;
+			if constexpr (std::is_same_v<T, Binary>) {
+				if (n.lhs && !weiExprPure(*n.lhs)) bad = true;
+				if (n.rhs && !weiExprPure(*n.rhs)) bad = true;
+			}
+			else if constexpr (std::is_same_v<T, Unary>) { if (n.operand && !weiExprPure(*n.operand)) bad = true; }
+			else if constexpr (std::is_same_v<T, IndexExpr>) { if (n.idx && !weiExprPure(*n.idx)) bad = true; }
+			else if constexpr (std::is_same_v<T, CastExpr>) { if (n.value && !weiExprPure(*n.value)) bad = true; }
+			else if constexpr (std::is_same_v<T, Output>) {
+				/* 输出不改动任何变量/数组，从"数值状态"看是纯的；
+				   但其参数里若含调用仍要拒绝。 */
+				for (auto& v : n.values) if (v && !weiExprPure(*v)) bad = true;
+			}
+			else if constexpr (std::is_same_v<T, IntLit> || std::is_same_v<T, BoolLit>
+			                   || std::is_same_v<T, DoubleLit> || std::is_same_v<T, StrLit>
+			                   || std::is_same_v<T, Ident> || std::is_same_v<T, ModulePathGet>
+			                   || std::is_same_v<T, SizeofExpr> || std::is_same_v<T, TypeofExpr>) { }
+			else bad = true;      /* Call / Output / Input / New / Delete / Asm ... */
+		}, e);
+		return !bad;
+	}
+
+	void NativeGen::collectArrayBounds(std::vector<Stmt>& body) {
+		/* ⓪ 保守闸门 A: 函数中只要出现 Input 或 Call（可能改动任意变量
+		   或数组），编译期常量与数组区间就都不可信 —— 整体放弃证明。
+		   宁可保留运行时检查，绝不拿"以为的常量"去豁免。 */
+		std::function<bool(const Stmt&)> hasSideEffectStmt = [&](const Stmt& st) -> bool {
+			bool yes = false;
+			auto rec = [&](const std::vector<Stmt>& v) {
+				for (auto& x : v) if (!yes && hasSideEffectStmt(x)) yes = true;
+			};
+			std::visit([&](const auto& n) {
+				using T = std::decay_t<decltype(n)>;
+				if constexpr (std::is_same_v<T, ExprStmt>) {
+					if (n.expr && !weiExprPure(*n.expr)) yes = true;
+				}
+				else if constexpr (std::is_same_v<T, AssignStmt>) {
+					if (n.value && !weiExprPure(*n.value)) yes = true;
+					if (n.target && !weiExprPure(*n.target)) yes = true;
+				}
+				else if constexpr (std::is_same_v<T, VarDecl>) {
+					if (n.init && !weiExprPure(*n.init)) yes = true;
+				}
+				else if constexpr (std::is_same_v<T, IfStmt>) {
+					if (n.cond && !weiExprPure(*n.cond)) yes = true;
+					rec(n.then_body); rec(n.else_body);
+				}
+				else if constexpr (std::is_same_v<T, WhileStmt> || std::is_same_v<T, ForStmt>
+				                   || std::is_same_v<T, LoopStmt> || std::is_same_v<T, LoopNStmt>
+				                   || std::is_same_v<T, CompileTimeStmt> || std::is_same_v<T, ForallStmt>)
+					rec(n.body);
+				else if constexpr (std::is_same_v<T, Block>) rec(n.stmts);
+				else if constexpr (std::is_same_v<T, WhenStmt>) { rec(n.then_body); rec(n.else_body); }
+				else if constexpr (std::is_same_v<T, SwitchStmt>) { for (auto& c : n.cases) rec(c.body.stmts); }
+				else if constexpr (std::is_same_v<T, MatchStmt>) { for (auto& c : n.cases) rec(c.body); rec(n.default_body); }
+				else if constexpr (std::is_same_v<T, DeferStmt>) rec(n.body.stmts);
+				else if constexpr (std::is_same_v<T, AsmStmt>) yes = true;
+			}, st);
+			return yes;
+		};
+		for (auto& st : body) {
+			if (hasSideEffectStmt(st)) return;      /* 不登记任何区间/常量 */
+		}
+
+		/* ① 顶层常量初值 */
+		for (auto& st : body) {
+			if (auto* vd = std::get_if<VarDecl>(&st)) {
+				if (vd->init) {
+					if (auto* il = std::get_if<IntLit>(vd->init.get())) var_init_const_[vd->name] = il->value;
+				}
+			} else if (auto* as = std::get_if<AssignStmt>(&st)) {
+				if (!as->target && as->value) {
+					if (auto* il = std::get_if<IntLit>(as->value.get())) var_init_const_[as->name] = il->value;
+					else var_init_const_.erase(as->name);
+				}
+			}
+		}
+
+		/* ② 识别定长初始化循环:
+		      while (iv < N) { arr[iv] = expr;  iv = iv + k; }
+		   并求 expr 在 iv ∈ [0,N) 下的区间。 */
+		struct Cand { std::string arr; const Stmt* loop; wei_i128 lo, hi; };
+		std::vector<Cand> cands;
+		for (auto& st : body) {
+			auto* ws = std::get_if<WhileStmt>(&st);
+			if (!ws || !ws->cond) continue;
+			auto* cb = std::get_if<Binary>(ws->cond.get());
+			if (!cb || cb->op != "<" || !cb->lhs || !cb->rhs) continue;
+			auto* cid = std::get_if<Ident>(cb->lhs.get());
+			if (!cid) continue;
+			int64_t N = 0;
+			if (auto* il = std::get_if<IntLit>(cb->rhs.get())) N = il->value;
+			else if (auto* rid = std::get_if<Ident>(cb->rhs.get())) {
+				auto q = var_init_const_.find(rid->name);
+				if (q == var_init_const_.end()) continue;
+				N = q->second;
+			} else continue;
+			if (N <= 0) continue;
+			std::string arr;
+			const Expr* val = nullptr;
+			int inc = 0; bool ok = true;
+			for (auto& bst : ws->body) {
+				auto* as = std::get_if<AssignStmt>(&bst);
+				if (!as) { ok = false; break; }
+				if (as->target) {
+					auto* ix = std::get_if<IndexExpr>(as->target.get());
+					auto* iid = ix ? std::get_if<Ident>(ix->idx.get()) : nullptr;
+					if (!ix || !iid || iid->name != cid->name || !as->value
+					    || !weiExprPure(*as->value)) { ok = false; break; }
+					if (!arr.empty() && arr != ix->name) { ok = false; break; }
+					arr = ix->name; val = as->value.get();
+				} else {
+					auto* b = std::get_if<Binary>(as->value.get());
+					auto* l = b ? std::get_if<Ident>(b->lhs.get()) : nullptr;
+					auto* c = b ? std::get_if<IntLit>(b->rhs.get()) : nullptr;
+					if (as->name != cid->name || !b || b->op != "+" || !l
+					    || l->name != cid->name || !c || c->value <= 0) { ok = false; break; }
+					inc++;
+				}
+			}
+			if (!ok || arr.empty() || !val || inc != 1) continue;
+			auto& vi = resolve_var(arr);
+			if (vi.array_len <= 0 || N > vi.array_len) continue;   /* 长度不足 → 越界写, 不登记 */
+			/* 临时登记归纳变量上界以区间求值；保存并恢复原值 */
+			auto oldIt = idx_ub_.find(cid->name);
+			bool hadOld = oldIt != idx_ub_.end();
+			int64_t oldUb = hadOld ? oldIt->second : 0;
+			noteIdxUB(cid->name, N);
+			Rng r = rngOf(*val);
+			if (hadOld) noteIdxUB(cid->name, oldUb); else dropIdxUB(cid->name);
+			if (!r.bounded || !r.ok) continue;
+			cands.push_back({arr, &st, r.lo, r.hi});
+		}
+
+		/* ③ 保守闸门: 该数组在**整个函数**里除这条初始化循环外不得再有写，
+		   也不得出现无法判定的结构。否则整条撤销。 */
+		for (auto& c : cands) {
+			if (arr_elem_bounds_.count(c.arr)) continue;   /* 同名只登记一次 */
+			bool dirty = false;
+			for (auto& st : body) {
+				if (&st == c.loop) continue;                 /* 跳过自身的初始化循环 */
+				if (weiArrayWrites(st, c.arr) != 0) { dirty = true; break; }
+			}
+			if (dirty) continue;
+			ArrBounds ab; ab.lo = c.lo; ab.hi = c.hi; ab.ok = true;
+			arr_elem_bounds_[c.arr] = ab;
+		}
+
+		/* ④ 记录每条 while 之前哪些变量已被赋值。
+		   证明时若累加器在其中，说明"编译期初值"已被前序代码改过，
+		   不能用来推 |s| 上界 —— 直接放弃。 */
+		std::set<std::string> written;
+		std::function<void(const Stmt&)> collectWrites = [&](const Stmt& st) {
+			auto rec = [&](const std::vector<Stmt>& v) { for (auto& x : v) collectWrites(x); };
+			std::visit([&](const auto& n) {
+				using T = std::decay_t<decltype(n)>;
+				if constexpr (std::is_same_v<T, AssignStmt>) {
+					if (!n.target) written.insert(n.name);
+				}
+				else if constexpr (std::is_same_v<T, Block>) rec(n.stmts);
+				else if constexpr (std::is_same_v<T, IfStmt>) { rec(n.then_body); rec(n.else_body); }
+				else if constexpr (std::is_same_v<T, WhileStmt> || std::is_same_v<T, ForStmt>
+				                   || std::is_same_v<T, LoopStmt> || std::is_same_v<T, LoopNStmt>
+				                   || std::is_same_v<T, CompileTimeStmt> || std::is_same_v<T, ForallStmt>)
+					rec(n.body);
+				else if constexpr (std::is_same_v<T, WhenStmt>) { rec(n.then_body); rec(n.else_body); }
+				else if constexpr (std::is_same_v<T, SwitchStmt>) { for (auto& c : n.cases) rec(c.body.stmts); }
+				else if constexpr (std::is_same_v<T, MatchStmt>) { for (auto& c : n.cases) rec(c.body); rec(n.default_body); }
+				else if constexpr (std::is_same_v<T, DeferStmt>) rec(n.body.stmts);
+			}, st);
+		};
+		for (auto& st : body) {
+			if (auto* ws = std::get_if<WhileStmt>(&st)) loop_pre_writes_[ws] = written;
+			collectWrites(st);
+		}
+	}
+
+	std::set<std::string> NativeGen::proveAccumNoOverflow(WhileStmt& w) {
+		std::set<std::string> result;
+		/* 诊断开关: WEI_NO_ACC_PROOF=1 关闭循环累加器证明，
+		   用于二分"证明路径"与"通用路径"的正确性问题。 */
+		static bool accOff = getenv("WEI_NO_ACC_PROOF") != nullptr;
+		if (accOff || !w.cond) return result;
+		auto* cb = std::get_if<Binary>(w.cond.get());
+		if (!cb || cb->op != "<" || !cb->lhs || !cb->rhs) return result;
+		auto* cid = std::get_if<Ident>(cb->lhs.get());
+		if (!cid) return result;
+		int64_t N = 0;
+		if (auto* il = std::get_if<IntLit>(cb->rhs.get())) N = il->value;
+		else if (auto* rid = std::get_if<Ident>(cb->rhs.get())) {
+			auto q = var_init_const_.find(rid->name);
+			if (q == var_init_const_.end()) return result;
+			N = q->second;
+		} else return result;
+		auto qi = var_init_const_.find(cid->name);
+		if (qi == var_init_const_.end()) return result;
+		int64_t iv0 = qi->second;
+		if (N <= iv0) return result;
+		wei_i128 trip = wei_i128(N) - wei_i128(iv0);
+		if (trip <= 0 || trip > wei_i128(INT64_MAX)) return result;
+		/* 两遍一致: 第二遍直接复用第一遍的证明结论。
+		   key 含函数名/trip/循环体大小，避免不同循环串味。 */
+		std::string proofKey = cur_qualname_ + "|" + std::to_string((long long)trip)
+		                     + "|" + std::to_string(w.body.size());
+		if (gen_pass_ == 2) {
+			auto cached = acc_proof_cache_.find(proofKey);
+			if (cached != acc_proof_cache_.end()) return cached->second;
+		}
+
+		/* 扫描循环体：严格形态 + 收集所有 `v = v ± X` 候选。
+		   同一变量可能有多条（如计数器 +1 与 -C 回绕），其绝对增量
+		   必须**求和**才是对 |v| 上界的保守估计，不能只证一条。 */
+		struct Cand { std::string name; const Expr* rhs; };
+		std::vector<Cand> cands;
+		std::set<std::string> nonSelfWrites;
+		bool bad = false;
+		std::function<void(const std::vector<Stmt>&)> scan = [&](const std::vector<Stmt>& v) {
+			for (auto& st : v) {
+				if (bad) return;
+				if (auto* as = std::get_if<AssignStmt>(&st)) {
+					if (as->target) { bad = true; return; }         /* 数组/指针写 */
+					if (!as->value || !weiExprPure(*as->value)) { bad = true; return; }
+					auto* b = std::get_if<Binary>(as->value.get());
+					auto* l = b ? std::get_if<Ident>(b->lhs.get()) : nullptr;
+					bool selfPlus = l && l->name == as->name;
+					if (as->name == cid->name) {
+						/* 归纳变量只能被 iv = iv + 正常量 推进，否则 trip 上界失效 */
+						auto* c = b ? std::get_if<IntLit>(b->rhs.get()) : nullptr;
+						if (!selfPlus || b->op != "+" || !c || c->value <= 0) { bad = true; return; }
+					}
+					if (selfPlus && b && (b->op == "+" || b->op == "-") && b->rhs)
+						cands.push_back({as->name, b->rhs.get()});
+					else
+						nonSelfWrites.insert(as->name);   /* s=常量 等: 初值不可靠 */
+				}
+				else if (auto* ifs = std::get_if<IfStmt>(&st)) {
+					if (!ifs->cond || !weiExprPure(*ifs->cond)) { bad = true; return; }
+					scan(ifs->then_body); scan(ifs->else_body);
+				}
+				else if (auto* vd = std::get_if<VarDecl>(&st)) {
+					if (vd->init && !weiExprPure(*vd->init)) { bad = true; return; }
+				}
+				else { bad = true; return; }   /* 嵌套循环/块/跳转/asm 等一律拒绝 */
+			}
+		};
+		scan(w.body);
+		if (bad || cands.empty()) return result;
+
+		auto absv = [](wei_i128 v) -> wei_i128 { return v < 0 ? -v : v; };
+		/* 按变量聚合每条增量的绝对值上界 */
+		std::map<std::string, wei_i128> sumMx;
+		std::set<std::string> disqualified;
+		for (auto& c : cands) {
+			Rng xr = rngOf(*c.rhs);
+			if (!xr.bounded || !xr.ok) { disqualified.insert(c.name); continue; }
+			wei_i128 mx = absv(xr.lo) > absv(xr.hi) ? absv(xr.lo) : absv(xr.hi);
+			sumMx[c.name] += mx;
+		}
+		auto pw = loop_pre_writes_.find(&w);
+		for (auto& x : nonSelfWrites) disqualified.insert(x);
+		for (auto& kv : sumMx) {
+			if (disqualified.count(kv.first)) continue;
+			/* 保守闸门 B: 该变量在本循环之前被赋过值 → 初值不可信 */
+			if (pw != loop_pre_writes_.end() && pw->second.count(kv.first)) continue;
+			auto qs = var_init_const_.find(kv.first);
+			if (qs == var_init_const_.end()) continue;
+			wei_i128 mx = kv.second;
+			/* 防 128 位乘法本身溢出 */
+			if (mx > 0 && trip > wei_i128(INT64_MAX) / mx) continue;
+			wei_i128 bound = absv(wei_i128(qs->second)) + trip * mx;
+			if (bound > wei_i128(INT64_MAX)) continue;
+			proofNote("循环变量不可能溢出", w.line);
+			result.insert(kv.first);
+		}
+		if (gen_pass_ == 1) acc_proof_cache_[proofKey] = result;
+		static bool dbg = getenv("WEI_DBG_ACC") != nullptr;
+		if (dbg) {
+			std::string names; for (auto& x : result) names += x + " ";
+			fprintf(stderr, "[acc] pass=%d line=%d trip=%lld result={%s}\n",
+			        gen_pass_, w.line, (long long)trip, names.c_str());
+		}
+		return result;
 	}
 
 	/* ── C1 · 位宽体系：表达式宽度推导 ────────────────────────────────────
@@ -18041,45 +19851,121 @@ struct PromoScan {
 	}
 };
 
+void NativeGen::spill_and_drop_pinned() {
+	if (pinned_.empty()) return;
+	/* 必须先禁 hook，否则下面的写回会被拦截成 `mov phys,phys` 空转，
+	   内存里留着的还是旧值，stub 读内存就会算错。 */
+	c_.set_slot_hook({});
+	c_.set_pre_align({});
+	c_.set_on_slot_addr({});
+	for (auto& kv : pinned_) {
+		int64_t d = -8 * static_cast<int64_t>(kv.first + 1);
+		c_.mov_memd8_64r(5, d, kv.second);       /* 真写回栈槽 */
+		loop_reg_vars_.erase(kv.first);          /* 清掉驻留映射, 之后读内存 */
+	}
+	pinned_.clear(); pinnedDisp_.clear(); pinned_name_.clear();
+}
+
 void NativeGen::promote_function_locals(FuncDecl& f) {
-	pinned_.clear(); pinned_name_.clear();
-	/* 暂不启用（promote_enable_ 默认 false）。
-	   原因: 把一个变量钉进寄存器，要求**所有**读写点都改走 emit_load_var /
-	   emit_store_var。现有代码里直接访问栈槽的地方有上百处，只改一半会让
-	   寄存器与内存失去同步 —— 实测基准结果变成栈地址那样的大数。
-	   这是 D1（真实寄存器分配）的范畴，等所有存取点统一后一次性开启。 */
-	if (!promote_enable_) return;
-	if (wide_mode_) return;                                  /* 影子高位槽活在内存里 */
-	PromoScan ps;
-	for (auto& p : f.params) { if (!weiPromotableType(p.type)) ps.ban.insert(p.name); ps.use(p.name, 1); }
-	ps.stmts(f.body, 1);
-	if (ps.hasAsm) return;
-	std::vector<std::pair<uint64_t, std::string>> cand;
-	for (auto& kv : ps.w) {
-		if (ps.ban.count(kv.first) || kv.second < 4) continue;
-		auto it = locals_.find(kv.first);
-		if (it == locals_.end() || !it->second.is_local || it->second.array_len > 0 || it->second.is_double) continue;
-		if (narrow_int_.count(kv.first) || widthOfVar(kv.first) > 0) continue;
-		cand.push_back({kv.second, kv.first});
+	/* 每进一个函数都重设 hook：c_ 是所有函数共用的发射缓冲，
+	   不清会串到下一个函数。空表 = 行为与未启用时逐字节一致。 */
+	pinned_.clear(); pinned_name_.clear(); pinnedDisp_.clear();
+	c_.set_slot_hook({});
+	c_.set_pre_align({});
+	c_.set_on_slot_addr({});
+	static bool regOff = getenv("WEI_NO_REGALLOC") != nullptr;   /* A/B 对照 */
+	if (!promote_enable_ || regOff || wide_mode_) return;        /* -wide 影子高位槽活在内存 */
+
+	/* ── 两遍一致性 ───────────────────────────────────────────────
+	   gen_pass_==1 时计算并缓存，==2 时强制复用。
+	   key 用函数限定名 + 参数个数 + 函数体语句数，避免同形函数串味。 */
+	std::vector<std::pair<uint32_t,int>> chosen;
+	if (gen_pass_ == 2) {
+		if (promote_seq_idx_ < promote_seq_.size()) chosen = promote_seq_[promote_seq_idx_++];
+		else return;                 /* 保守: 顺序对不上就不启用，绝不猜 */
+	} else {
+		PromoScan ps;
+		for (auto& p : f.params) {
+			if (!weiPromotableType(p.type)) ps.ban.insert(p.name);
+			ps.use(p.name, 1);
+		}
+		ps.stmts(f.body, 1);
+		if (ps.hasAsm) return;                       /* asm 可能引用任意槽 */
+		std::vector<std::pair<uint64_t, std::string>> cand;
+		for (auto& kv : ps.w) {
+			if (ps.ban.count(kv.first) || kv.second < 4) continue;
+			auto it = locals_.find(kv.first);
+			if (it == locals_.end() || !it->second.is_local
+			    || it->second.array_len > 0 || it->second.is_double) continue;
+			if (narrow_int_.count(kv.first) || widthOfVar(kv.first) > 0) continue;
+			cand.push_back({kv.second, kv.first});
+		}
+		/* 确定性排序: 权重降序、名字升序，保证两遍/多次编译结果一致 */
+		std::sort(cand.begin(), cand.end(),
+		          [](const std::pair<uint64_t,std::string>& a, const std::pair<uint64_t,std::string>& b) {
+			          return a.first != b.first ? a.first > b.first : a.second < b.second;
+		          });
+		/* 保守池: r14/r15/r12 是 callee-saved，序言已 push 保存，且旧式
+		   发射器不会在未保存的情况下把它们当临时寄存器破坏。
+		   r13/rbx 会被某些 legacy 路径借用（需 spill/reload 围栏），
+		   本轮不纳入，避免"寄存器与内存失去同步"的静默算错。 */
+		/* 只占 r15：循环提升池是 {rbx,r12,r13,r14}，占 r12/r14 会把
+		   它的可用寄存器从 4 个削到 2 个，实测数组累加反而慢 50%。
+		   r15 是唯一不被循环提升使用的 callee-saved；虽然输出 stub 会
+		   借它暂存栈指针，但已有 spill/deopt 处理，不冲突。 */
+		static const int pool[1] = {15};
+		for (size_t i = 0; i < cand.size() && i < 1; i++) {
+			auto& vi = locals_[cand[i].second];
+			chosen.push_back({vi.slot, pool[i]});
+		}
+		promote_seq_.push_back(chosen);
+		promote_seq_idx_++;
 	}
-	std::sort(cand.begin(), cand.end(), [](const std::pair<uint64_t, std::string>& a, const std::pair<uint64_t, std::string>& b) {
-		return a.first != b.first ? a.first > b.first : a.second < b.second;
-	});
-	/* r14/r15/r12 不会被旧式发射器在未保存的情况下破坏；r13 与 rbx 会（有 spill/reload 围栏） */
-	std::vector<int> pool = {14, 15, 12, 13};
-	if (!ps.usesRbx) pool.push_back(3);
-	for (size_t i = 0; i < cand.size() && i < pool.size(); i++) {
-		auto& vi = locals_[cand[i].second];
-		pinned_[vi.slot] = pool[i];
-		pinned_name_[vi.slot] = cand[i].second;
-		loop_reg_vars_[vi.slot] = pool[i];
+
+	for (auto& kv : chosen) {
+		uint32_t slot = kv.first;
+		int phys = kv.second;
+		int64_t disp = -8 * static_cast<int64_t>(slot + 1);
+		pinned_[slot] = phys;
+		pinnedDisp_[disp] = phys;
+		pinned_name_[slot] = "";   /* 名字仅诊断用，slot 已是唯一键 */
+		/* 不写 loop_reg_vars_！循环提升路径(try_while_promote 等)也往
+		   loop_reg_vars_ 里塞映射，且可能挑中同一个物理寄存器 —— 两个
+		   变量共用一个寄存器会互相覆盖，实测 Collatz 嵌套循环直接死循环。
+		   hook 已经拦截了所有 [rbp+d] 读写（含 mov64r_memd8/alu_r64_memd8/
+		   cmp/imul/imm 形式），Ident / emit_load_var 走内存原语时会自动
+		   重定向到 phys，无需借助 regOfSlot。 */
 	}
-	for (auto& p : f.params) {                                /* 参数从栈上进来 */
+	/* hook: disp → phys。精确 key，保存寄存器槽 / canary / spill 槽都不在表里 */
+	/* 参数从栈上进来，必须**在 hook 设置之前**装入驻留寄存器。
+	   mov64r_memd32 也已接入 hook，若此时 hook 生效会被拦截成
+	   `mov phys,phys` 空转 —— 实测 F::run(int x) 返回的是调用者残留的
+	   栈指针值（输出 140735188379368 而非 2005）。 */
+	for (auto& p : f.params) {
 		auto it = locals_.find(p.name);
 		if (it == locals_.end()) continue;
 		auto pit = pinned_.find(it->second.slot);
-		if (pit != pinned_.end()) c_.mov64r_memd8(pit->second, 5, -8 * static_cast<int>(it->second.slot + 1));
+		if (pit == pinned_.end()) continue;
+		int64_t d = -8 * static_cast<int64_t>(it->second.slot + 1);
+		c_.mov64r_memd32(pit->second, 5, static_cast<int32_t>(d));
 	}
+
+	static bool dbgRA = getenv("WEI_DBG_RA") != nullptr;
+	if (dbgRA) {
+		std::string ss;
+		for (auto& kv : pinnedDisp_) ss += " d" + std::to_string(kv.first) + "->r" + std::to_string(kv.second);
+		fprintf(stderr, "[RA] pass=%d func=%s canary=%d{%s}\n",
+		        gen_pass_, cur_qualname_.c_str(), canary_disp_, ss.c_str());
+	}
+	c_.set_slot_hook([this](int64_t d) -> int {
+		auto it = pinnedDisp_.find(d);
+		return it == pinnedDisp_.end() ? -1 : it->second;
+	});
+	/* 任何输出/外部调用 stub 进入前，先 spill 并降级到内存路径。
+	   r15 会被 stub 借用暂存栈指针，不降级就会把栈地址当变量值打印。 */
+	c_.set_pre_align([this]() { spill_and_drop_pinned(); });
+	c_.set_on_slot_addr([this]() { spill_and_drop_pinned(); });
+
 }
 
 void NativeGen::emit_sync_pinned(bool toMem, const std::function<bool(uint32_t)>& want) {
@@ -18127,14 +20013,73 @@ NativeGen::Leaf NativeGen::leafOf(Expr& e) {
 /* 区间证明。idx_ub_ 给出迭代开始时 i ∈ [0,ub)；这里保守用 [0,ub]（i 可能已自增） */
 NativeGen::Rng NativeGen::rngOf(const Expr& e) {
 	Rng r;
-	auto fits = [](const Rng& x) { return x.lo >= wei_i128(INT64_MIN) && x.hi <= wei_i128(INT64_MAX); };
-	if (auto* il = std::get_if<IntLit>(&e)) { r.lo = r.hi = il->value; r.ok = true; return r; }
-	if (auto* id = std::get_if<Ident>(&e)) {
-		auto it = idx_ub_.find(id->name);
-		if (it != idx_ub_.end() && it->second > 0) { r.lo = 0; r.hi = it->second; r.ok = true; }
+	if (auto* il = std::get_if<IntLit>(&e)) {
+		r.lo = r.hi = il->value; r.bounded = true; r.ok = true; return r;
+	}
+	if (auto* bl = std::get_if<BoolLit>(&e)) {
+		r.lo = r.hi = (bl->value ? 1 : 0); r.bounded = true; r.ok = true; return r;
+	}
+	if (auto* ix = std::get_if<IndexExpr>(&e)) {
+		/* D1: 数组元素区间由定长初始化循环静态分析得出（全数组上界，
+		   与下标无关，故保守成立）。未登记则证不出，保持 unbounded。 */
+		auto ait = arr_elem_bounds_.find(ix->name);
+		if (ait != arr_elem_bounds_.end() && ait->second.ok) {
+			r.lo = ait->second.lo; r.hi = ait->second.hi;
+			r.bounded = true;
+			r.ok = r.lo >= wei_i128(INT64_MIN) && r.hi <= wei_i128(INT64_MAX);
+		}
 		return r;
 	}
-	if (auto* b = std::get_if<Binary>(&e)) return rngOfBin(*b);
+	if (auto* id = std::get_if<Ident>(&e)) {
+		auto it = idx_ub_.find(id->name);
+		if (it != idx_ub_.end() && it->second > 0) { r.lo = 0; r.hi = it->second; r.bounded = true; r.ok = true; }
+		/* 取模归纳变量: 恒在 [0,C)（见 mod_iv_bounds_ 注释） */
+		auto mit = mod_iv_bounds_.find(id->name);
+		if (mit != mod_iv_bounds_.end() && mit->second > 0) {
+			r.lo = 0; r.hi = mit->second - 1; r.bounded = true; r.ok = true;
+		}
+		return r;
+	}
+	if (auto* u = std::get_if<Unary>(&e)) {
+		if (u->op == "-" && u->operand) {
+			Rng a = rngOf(*u->operand);
+			if (a.bounded) { r.lo = -a.hi; r.hi = -a.lo; r.bounded = true; r.ok = r.ok || (r.lo >= wei_i128(INT64_MIN) && r.hi <= wei_i128(INT64_MAX)); r.ok = r.lo >= wei_i128(INT64_MIN) && r.hi <= wei_i128(INT64_MAX); }
+		}
+		return r;
+	}
+	if (auto* b = std::get_if<Binary>(&e)) {
+		Rng br = rngOfBin(*b);
+		if (br.bounded) return br;
+		/* 比较与逻辑运算: 结果恒为 0/1 */
+		if (b->op == "==" || b->op == "!=" || b->op == "<" || b->op == ">" || b->op == "<=" || b->op == ">="
+		    || b->op == "&&" || b->op == "and" || b->op == "||" || b->op == "or") {
+			r.lo = 0; r.hi = 1; r.bounded = true; r.ok = true; return r;
+		}
+		/* 常量取模: 被除数非负、除数为正常量常数 → 结果 [0, C-1]。
+		   这既是"编译期证明下标在界内"的通用路径，也保持 C 语义
+		   （负数被除数的余数为负，故只在 a.lo>=0 时成立）。 */
+		if (b->op == "%" && b->rhs && b->lhs) {
+			Rng a = rngOf(*b->lhs), c = rngOf(*b->rhs);
+			if (a.bounded && c.bounded && a.lo >= 0 && c.lo == c.hi && c.lo > 0) {
+				r.lo = 0; r.hi = c.lo - 1; r.bounded = true; r.ok = true; return r;
+			}
+		}
+		/* 常量除法: 两侧非负且除数不含 0 → 保守区间 */
+		if (b->op == "/" && b->rhs && b->lhs) {
+			Rng a = rngOf(*b->lhs), c = rngOf(*b->rhs);
+			if (a.bounded && c.bounded && a.lo >= 0 && c.lo > 0) {
+				r.lo = a.lo / c.hi; r.hi = a.hi / c.lo; r.bounded = true; r.ok = true; return r;
+			}
+		}
+		/* 位与: 两侧非负时结果不超过任一操作数 */
+		if (b->op == "&" && b->rhs && b->lhs) {
+			Rng a = rngOf(*b->lhs), c = rngOf(*b->rhs);
+			if (a.bounded && c.bounded && a.lo >= 0 && c.lo >= 0) {
+				r.lo = 0; r.hi = (a.hi < c.hi ? a.hi : c.hi); r.bounded = true; r.ok = true; return r;
+			}
+		}
+		return r;
+	}
 	return r;
 }
 NativeGen::Rng NativeGen::rngOfBin(const Binary& b) {
@@ -18150,13 +20095,56 @@ NativeGen::Rng NativeGen::rngOfBin(const Binary& b) {
 		r.lo = r.hi = p[0];
 		for (int i = 1; i < 4; i++) { if (p[i] < r.lo) r.lo = p[i]; if (p[i] > r.hi) r.hi = p[i]; }
 	}
-	r.ok = fits(r);                                          /* 每个节点都必须装得下，故中间结果不可能溢出 */
+	r.bounded = a.bounded && c.bounded;
+	r.ok = r.bounded && fits(r);                            /* 每个节点都必须装得下，故中间结果不可能溢出 */
 	return r;
 }
 bool NativeGen::ovfProven(Binary& n) {
 	if (!check_enabled(CheckKind::Overflow)) return true;    /* 用户选了不含溢出检查的等级 */
 	/* Binary 含 unique_ptr（move-only），装不进 variant，故走专用重载 */
-	return rngOfBin(n).ok;
+	bool ok = rngOfBin(n).ok;
+	if (ok) proofNote("算术不会溢出", n.line);
+	return ok;
+}
+
+/* ── 编译期证明层（对标 Rust 的两个痛点）─────────────────────────────
+   Rust: release 模式整数溢出**静默回绕**（不 panic）；动态下标越界只能
+         在运行时 panic。两者都要等到程序跑起来才暴露。
+   Wei : 区间分析能在编译期证明"必然"发生时就直接报 error，编不过；
+         证明不了才退回运行时检测（绝不回绕、绝不静默）。
+   关键安全约束: 只在**整个区间**都落在合法范围之外时报错。区间是保守
+   近似，只要还含一个合法值就不能断定必然出错 —— 绝不误报。 */
+bool NativeGen::mustOverflow(const Expr& e) {
+	Rng r = rngOf(e);
+	if (!r.bounded) return false;
+	return r.lo > wei_i128(INT64_MAX) || r.hi < wei_i128(INT64_MIN);
+}
+bool NativeGen::mustBeOOB(const Expr& idx, int64_t len) {
+	Rng r = rngOf(idx);
+	if (!r.bounded || len <= 0) return false;
+	return r.lo >= wei_i128(len) || r.hi < 0;
+}
+void NativeGen::proofNote(const char* what, int line) {
+	static bool on = getenv("WEI_PROOF_REPORT") != nullptr;
+	if (on) fprintf(stderr, "[proof] line %d: %s —— 编译期已证明，省略运行时检查\n", line, what);
+}
+void NativeGen::checkProvenOOB(const IndexExpr& n, int64_t len) {
+	if (!n.idx || !mustBeOOB(*n.idx, len)) return;
+	auto d = wei::diag::makeError("E0502", "编译期已证明数组下标必然越界", {n.line, n.col, 1});
+	d.labels[0].msg = "下标的所有可能取值都落在 [0," + std::to_string(len) + ") 之外";
+	d.help("把下标改回合法范围；或检查循环上界与数组长度是否写错");
+	d.note("Wei 在编译期证明「必然越界」时直接报错，而不是等运行时 panic");
+	throw wei::diag::DiagnosticError(d);
+}
+void NativeGen::checkProvenOverflow(const Binary& n) {
+	/* Binary 含 unique_ptr，装不进 variant，故直接走专用重载 */
+	Rng r = rngOfBin(n);
+	if (!r.bounded || !(r.lo > wei_i128(INT64_MAX) || r.hi < wei_i128(INT64_MIN))) return;
+	auto d = wei::diag::makeError("E0503", "编译期已证明整数运算必然溢出", {n.line, n.col, 1});
+	d.labels[0].msg = "该表达式所有可能取值都超出 int64 范围";
+	d.help("缩小操作数范围，或改用更宽的类型/显式处理溢出");
+	d.note("Wei 不会像 Rust release 那样静默回绕：能证明就编译期报错，证不了就运行时检测");
+	throw wei::diag::DiagnosticError(d);
 }
 
 void NativeGen::emit_alu_leaf(const std::string& op, int d, const Leaf& l) {
@@ -18353,7 +20341,61 @@ bool NativeGen::try_cmov_if(IfStmt& n) {
 
 /* ═══ 第 5 节: 比较+分支融合 与 循环旋转 ═══ */
 /* 发射后 FLAGS 满足: jcc(返回值) <=> cond 为真 */
+bool NativeGen::modpow2_test(Expr& cmpL, Expr& cmpR, const std::string& cmpOp,
+                             Expr** valExpr, int64_t* mask, int* cc) {
+	static bool off = getenv("WEI_NO_MODPOW2") != nullptr;   /* A/B 对照 */
+	if (off) return false;
+	if (cmpOp != "==" && cmpOp != "!=") return false;
+	/* 必须有一边是字面量 0。只优化「与 0 比较」——
+	   x%C == 1 之类在 x 为负时余数符号不同，不能压成位测试。 */
+	Expr* other = nullptr;
+	if (auto* il = std::get_if<IntLit>(&cmpL)) { if (il->value == 0) other = &cmpR; }
+	if (!other) {
+		if (auto* il = std::get_if<IntLit>(&cmpR)) { if (il->value == 0) other = &cmpL; }
+	}
+	if (!other) return false;
+	auto* mb = std::get_if<Binary>(other);
+	if (!mb || mb->op != "%" || !mb->rhs) return false;
+	auto* ci = std::get_if<IntLit>(mb->rhs.get());
+	if (!ci || ci->value <= 0) return false;
+	int64_t C = ci->value;
+	if ((C & (C - 1)) != 0) return false;          /* 必须是 2 的幂 */
+	if (C > (1LL << 31)) return false;             /* mask 要能塞进 imm32 */
+	if (!mb->lhs) return false;
+	if (i32_mode_ || wide_mode_) return false;     /* 32/128 位通路另有语义 */
+	if (isDblExpr(mb->lhs) || isDblExpr(mb->rhs)) return false;
+	if (exprIsI32(*mb->lhs) || widthOfExpr(*mb->lhs) > 0) return false;
+	*valExpr = mb->lhs.get();
+	*mask = C - 1;
+	*cc = (cmpOp == "==") ? 0x4 : 0x5;            /* je / jne == sete / setne */
+	return true;
+}
+
+bool NativeGen::try_modpow2_flags(Expr& cond, int& ccOut) {
+	auto* b = std::get_if<Binary>(&cond);
+	if (!b || !b->lhs || !b->rhs) return false;
+	Expr* v = nullptr; int64_t mask = 0; int cc = 0;
+	if (!modpow2_test(*b->lhs, *b->rhs, b->op, &v, &mask, &cc)) return false;
+	gen_expr(*v);
+	c_.test_rm64_imm32(0, static_cast<int32_t>(mask));
+	ccOut = cc;
+	return true;
+}
+
+bool NativeGen::try_modpow2_value(Binary& n) {
+	if (!n.lhs || !n.rhs) return false;
+	Expr* v = nullptr; int64_t mask = 0; int cc = 0;
+	if (!modpow2_test(*n.lhs, *n.rhs, n.op, &v, &mask, &cc)) return false;
+	gen_expr(*v);
+	c_.test_rm64_imm32(0, static_cast<int32_t>(mask));
+	c_.setcc_r8(cc, 0);
+	c_.movzx_r64_rm8(0, 0);
+	return true;
+}
+
 int NativeGen::emit_cmp_flags(Expr& cond) {
+	int mcc = 0;
+	if (try_modpow2_flags(cond, mcc)) return mcc;   /* %2^k 判零 → test+jcc */
 	if (auto* b = std::get_if<Binary>(&cond)) {
 		if (weiIsCmpOp(b->op) && !i32_mode_ && !wide_mode_ && !exprIsI32(*b->lhs) && !exprIsI32(*b->rhs)
 		        && !isDblExpr(b->lhs) && !isDblExpr(b->rhs)
@@ -18372,6 +20414,22 @@ int NativeGen::emit_cmp_flags(Expr& cond) {
 			}
 			return weiCmpCC(b->op);
 		}
+	}
+	/* 裸真值判断 `if (x % 2^k)` —— 语义即 `!= 0`，同样可压成 test */
+	if (getenv("WEI_NO_MODPOW2") == nullptr) {
+	if (auto* mb = std::get_if<Binary>(&cond)) {
+		if (mb->op == "%" && mb->rhs && mb->lhs && !i32_mode_ && !wide_mode_
+		        && !isDblExpr(mb->lhs) && !exprIsI32(*mb->lhs) && widthOfExpr(*mb->lhs) == 0) {
+			if (auto* ci = std::get_if<IntLit>(mb->rhs.get())) {
+				int64_t C = ci->value;
+				if (C > 1 && C <= (1LL << 31) && (C & (C - 1)) == 0) {
+					gen_expr(*mb->lhs);
+					c_.test_rm64_imm32(0, static_cast<int32_t>(C - 1));
+					return 0x5;                              /* jne → x%2^k != 0 */
+				}
+			}
+		}
+	}
 	}
 	gen_expr(cond); c_.test_rm64_r64(0, 0);
 	return 0x5;                                              /* jne */
@@ -18433,6 +20491,17 @@ bool NativeGen::emit_for_rotated(ForStmt& n) {               /* init 已由调�
 }
 
 	void NativeGen::gen_func(FuncDecl& f) {
+		/* ── D1: 必须在**函数序言之前**清掉上一个函数的 slot hook ──
+		   序言会写 stack canary 到 [rbp+canary_disp_]。若沿用上一个函数
+		   的 pinnedDisp_，且该 disp 恰好命中，canary 就会被写进物理寄存器
+		   而非内存 → 尾声 canary 校验读回 0 → SIGTRAP。
+		   实测: 第二个函数 canary=-56 命中 d-56→r14，基准 5 项全 RUN-FAIL。
+		   promote_function_locals 在 gen_block 之前才设置新表，太晚了。 */
+		c_.set_slot_hook({});
+		c_.set_pre_align({});
+		c_.set_on_slot_addr({});
+		pinned_.clear(); pinned_name_.clear(); pinnedDisp_.clear();
+
 		/* 通用循环展开: 必须在取模归纳变量改写**之后** —— 取模改写会往
 		   循环体尾部追加计数器推进语句，展开要复制的是改写后的完整体。
 		   顺序反了会把推进语句漏在展开体之外，结果算错。 */
@@ -18468,6 +20537,11 @@ bool NativeGen::emit_for_rotated(ForStmt& n) {               /* init 已由调�
 			}
 		}
 		rewrite_mod_induction_vars(f.body);
+		/* D1: 收集数组元素区间与变量初值，供循环级溢出证明使用。
+		   每遍 generate 都重算（清干净，避免跨函数/跨遍串味）。 */
+		arr_elem_bounds_.clear(); var_init_const_.clear(); loop_pre_writes_.clear();
+		active_ovf_free_vars_.clear(); suppress_ovf_ = false;
+		collectArrayBounds(f.body);
 		/* 展开仍只在第一遍做: AST 改写做两遍会让 body 指数膨胀 */
 		if (gen_pass_ == 1) {
 			for (size_t i = 0; i < f.body.size(); ) {
@@ -18486,6 +20560,7 @@ bool NativeGen::emit_for_rotated(ForStmt& n) {               /* init 已由调�
 			}
 		} dbg_end{this, f.name, dbg_start};
 		cur_ret_double_ = (f.ret_type == "double" || f.ret_type == "浮点");
+		cur_ret_result_ = (f.ret_type == "Result");
 		if (getenv("WEI_MONO_DEBUG")) fprintf(stderr, "[gen] %s ret=%s dbl=%d off=%zu\n", f.name.c_str(), f.ret_type.c_str(), (int)cur_ret_double_, c_.pos());
 		if (!cur_qualname_.empty()) {
 			func_offsets_[cur_qualname_] = c_.pos();   /* mod 成员: "Mod::member" */
@@ -18646,6 +20721,8 @@ bool NativeGen::emit_for_rotated(ForStmt& n) {               /* init 已由调�
 	   Returns the buffer to be used as JIT code. */
 	std::vector<uint8_t> NativeGen::generate() {
 		gen_pass_++;
+		if (gen_pass_ == 1) promote_seq_.clear();
+		promote_seq_idx_ = 0;
 		c_.clear();
 		globals_.clear();
 		num_globals_ = 0;
@@ -20501,7 +22578,9 @@ bool NativeGen::emit_for_rotated(ForStmt& n) {               /* init 已由调�
 		return new Win64Target();
 	}
 
-	bool doBuild(const std::string& file, Target* target, const std::string& outputExe, bool enable_opt = false, bool enable_ir = false, bool wide = false, WeiStd dialect = WeiStd::Wei27, const std::string& normOut = std::string(), bool enable_debug = false, int check_level = 2) {
+	bool doBuild(const std::string& file, Target* target, const std::string& outputExe, bool enable_opt = false, bool enable_ir = false, bool wide = false, WeiStd dialect = WeiStd::Wei27, const std::string& normOut = std::string(), bool enable_debug = false, int check_level = 2, bool error_trace = true) {
+		/* '?' 传播链开关：只影响代码生成阶段注入的站点打印，不改语义。 */
+		wei::diag::setErrorTrace(error_trace);
 		/* A3: 记录源目录，使 import 能就近找到同目录/同目录 lib 下的模块 */
 		{
 			size_t sl = file.find_last_of("/\\");
@@ -20512,7 +22591,7 @@ bool NativeGen::emit_for_rotated(ForStmt& n) {               /* init 已由调�
 		try {
 			src = readFile(file);
 		} catch (const std::exception& e) {
-			emitError(file, e.what());
+			emitException(file, e);
 			return false;
 		}
 
@@ -20536,7 +22615,7 @@ bool NativeGen::emit_for_rotated(ForStmt& n) {               /* init 已由调�
 			Lexer lex(std::move(src));
 			tokens = lex.scan();
 		} catch (const std::exception& e) {
-			emitError(file, e.what());
+			emitException(file, e);
 			return false;
 		}
 
@@ -20578,7 +22657,7 @@ bool NativeGen::emit_for_rotated(ForStmt& n) {               /* init 已由调�
 			ps.setCurFile(file);
 			prog = ps.parse();
 		} catch (const std::exception& e) {
-			emitError(file, e.what());
+			emitException(file, e);
 			return false;
 		}
 
@@ -20586,7 +22665,7 @@ bool NativeGen::emit_for_rotated(ForStmt& n) {               /* init 已由调�
 			wei::mono::monomorphize(prog);
 			wei::midstage::foldProgram(prog);   /* 处理端: 编译期求值确定性循环 */
 		} catch (const std::exception& e) {
-			emitError(file, e.what());
+			emitException(file, e);
 			return false;
 		}
 
@@ -20594,7 +22673,7 @@ bool NativeGen::emit_for_rotated(ForStmt& n) {               /* init 已由调�
 			auto tc = wei::types::TypeChecker();
 			tc.check(prog);
 		} catch (const std::exception& e) {
-			emitError(file, e.what());
+			emitException(file, e);
 			return false;
 		}
 
@@ -20614,7 +22693,7 @@ bool NativeGen::emit_for_rotated(ForStmt& n) {               /* init 已由调�
 		try {
 			native = ng.generate();
 		} catch (const std::exception& e) {
-			emitError(file, e.what());
+			emitException(file, e);
 			return false;
 		}
 		/* 调试开关: WEI_DUMP_ASM=<path> 把代码段原始字节落盘，
@@ -20634,13 +22713,13 @@ bool NativeGen::emit_for_rotated(ForStmt& n) {               /* init 已由调�
 		try {
 			native = ng.generate();
 		} catch (const std::exception& e) {
-			emitError(file, e.what());
+			emitException(file, e);
 			return false;
 		}
 		try {
 			target->finalize(ng, native, code_size, outputExe);
 		} catch (const std::exception& e) {
-			emitError(file, e.what());
+			emitException(file, e);
 			return false;
 		}
 		return true;
@@ -20663,6 +22742,16 @@ int main(int argc, char** argv) {
 	SetConsoleCP(65001);
 #endif
 
+	/* 诊断系统: 颜色按 TTY 自动开关（NO_COLOR / WEI_FORCE_COLOR 可覆盖），
+	   并把关键字表灌进建议器，用于"你是不是想写 xxx"。 */
+	wei::diag::detectColor();
+	{
+		std::vector<std::string> kws;
+		kws.reserve(kEngKws.size());
+		for (auto& kv : kEngKws) kws.push_back(kv.first);
+		wei::diag::registerKeywords(kws);
+	}
+
 	if (argc < 2) {
 		wei::front::printStart();
 		return 0;
@@ -20672,6 +22761,19 @@ int main(int argc, char** argv) {
 	if (sub == "version" || sub == "-v" || sub == "--version") {
 		wei::front::printVersion(detectBackend());
 		return 0;
+	}
+
+	/* ── 内置错误码手册（离线、中英双语、带可编译示例）─────────────────
+	   必须放在 argc<3 的通用检查之前：explain 的参数是错误码而不是文件。 */
+	if (sub == "explain" || sub == "--explain" || sub == "-e") {
+		if (argc < 3) {
+			std::printf("用法: mtg explain <错误码>，例如 mtg explain E0277\n");
+			return 2;
+		}
+		return wei::diag::printExplain(argv[2]);
+	}
+	if (sub == "--list-codes" || sub == "codes" || sub == "-E") {
+		return wei::diag::listCodes();
 	}
 
 	if (argc < 3) {
@@ -20750,6 +22852,7 @@ int main(int argc, char** argv) {
 			bool debug_info = false;  /* -g: 生成 DWARF 调试信息 */
 			int check_level_v = 2;    /* C3: -check 等级，默认 standard */
 		bool wide = false;  /* -wide: 128 位宽算术（实验性，约一半速度）*/
+		bool error_trace = true;  /* '?' 传播链，默认开启；-no-error-trace 关闭 */
 		WeiStd dialect = WeiStd::Wei27;   /* -std:wei27 | 中文 | 文言 */
 		std::string normOut;              /* -emit-norm:<文件> 导出改写结果 */
 		std::string target_name =
@@ -20766,6 +22869,8 @@ int main(int argc, char** argv) {
 			}
 			if (std::string(argv[i]) == "-no-opt") opt = false;
 			if (std::string(argv[i]) == "-g") debug_info = true;
+			if (std::string(argv[i]) == "-no-error-trace") error_trace = false;
+			if (std::string(argv[i]) == "-error-trace") error_trace = true;
 			/* C3: -check=none|min|standard|full */
 			if (std::string(argv[i]).rfind("-check=", 0) == 0) {
 				std::string lv = std::string(argv[i]).substr(7);
@@ -20794,14 +22899,16 @@ int main(int argc, char** argv) {
 		if (outExe.empty()) {
 			outExe = basenameNoExt(file) + std::string(target->id() == std::string("win64") ? ".exe" : "");
 		}
-		if (!doBuild(file, target, outExe, opt, enable_ir, wide, dialect, normOut, debug_info, check_level_v)) return 1;
+		if (!doBuild(file, target, outExe, opt, enable_ir, wide, dialect, normOut, debug_info, check_level_v, error_trace)) return 1;
 		wei::front::printBuildOK(outExe, target->id());
 		return 0;
 	}
 
 	wei::front::printError("错误: 未知子命令 '" + sub + "'");
 	std::cout << "用法: mtg build <文件> [-o 输出] [-std:wei27|中文|文言]"
-	          << " [-emit-norm:<文件>] [-target linux64|win64] [-no-opt] [-wide]\n";
+	          << " [-emit-norm:<文件>] [-target linux64|win64] [-no-opt] [-wide]"
+	          << " [-no-error-trace]\n";
+	std::cout << "      mtg explain <错误码> | mtg --list-codes | mtg --version\n";
 	return 2;
 }
 

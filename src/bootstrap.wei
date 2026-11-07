@@ -3513,18 +3513,19 @@ create.mod Parse::body(ptr.int ctx, int fnIdx).int {
             if (kind == 10) {
                 if (Parse::closeMatch(ctx, depth, saved) == 0) { return 0; }
             } else {
-            if (kind == 11) {
-                if (Parse::closeCase(ctx, depth, saved) == 0) { return 0; }
-            } else {
-                if (kind == 1 || kind == 2) {
-                    if (Parse::closeIf(ctx, depth, kind, saved) == 0) { return 0; }
+                if (kind == 11) {
+                    if (Parse::closeCase(ctx, depth, saved) == 0) { return 0; }
                 } else {
-                    if (kind == 3 || kind == 7 || kind == 8 || kind == 9) {
-                        if (Parse::closeLoop(ctx, depth, kind, saved) == 0) { return 0; }
+                    if (kind == 1 || kind == 2) {
+                        if (Parse::closeIf(ctx, depth, kind, saved) == 0) { return 0; }
                     } else {
-                        Lex::next(ctx);
-                        Ctx::set(ctx, 256, saved);
-                        Ctx::set(ctx, 520, depth);
+                        if (kind == 3 || kind == 7 || kind == 8 || kind == 9) {
+                            if (Parse::closeLoop(ctx, depth, kind, saved) == 0) { return 0; }
+                        } else {
+                            Lex::next(ctx);
+                            Ctx::set(ctx, 256, saved);
+                            Ctx::set(ctx, 520, depth);
+                        }
                     }
                 }
             }

@@ -25,6 +25,16 @@
 - 完整的 GPLv3 许可证文本
 - 文言文扫雷示例 `saolei.wenyan.wei`：九道棋盘、十雷、首击安全，支持树旗、
   漫延、胜负判定与再局
+- 内置错误码手册：14 条错误码的中英双语条目，含成因、最小复现与可直接编译的
+  修复片段；新增 `mtg explain <码>` / `mtg --explain <码>` / `mtg --list-codes`
+  子命令，完全离线，不依赖网络或外部文档
+- `?` 自动错误传播链：编译期把每个 `?` 的源文件、行列、所在函数与被调函数
+  注入生成物，Err 时由内向外逐层打印完整链路，无需 anyhow / backtrace 之类
+  的第三方依赖；`-no-error-trace` 可关闭，关闭后不注入任何额外指令
+- `Main::main().Result` 中 `?` 触发时以错误码绝对值调用 `ExitProcess`，
+  Rust 风格的错误返回不再静默失败
+- `tests/rustplus/` 验收套件：`ok.wei`、`trace.wei`、`e0277.wei` 与 `run.ps1`，
+  覆盖手册、Ok/Err 路径、两层传播链、关闭开关与精确诊断共 19 项断言
 
 ### Fixed
 
@@ -42,12 +52,40 @@
 - 入口桩在泄漏检查前用 ECX 保存 main 返回值，ECX 被格式串指针覆盖；现先写
   `[rsp+0x20]`，泄漏检查后再装入 RCX
 - 新增第 13 个 IAT 槽后同步修正 `importSize`、格式串偏移与 ILT 回填
+- `Main::main().Result` 的错误码原先被入口桩丢弃，进程退出码恒为 0
+  （`return -7` 与 `?` 传播均静默失败）；现由 `?` 的 Err 分支直接以错误码
+  绝对值退出，退出码可观测
+- `E0277` 诊断原先标在整个调用表达式上，现精确标在 `?` 上（`Call` 新增
+  `try_line` / `try_col`），并补上指向 `mtg explain E0277` 的 help 行
+- `--list-codes` 的中文列改为按显示宽度补齐，修正 CJK 占 2 列导致的错位
+- `?` 传播链中的源路径统一为 `/`，消除 `H:/dir\file.wei` 混用分隔符
+- 修复模块成员名与宽度关键字的冲突：`u8` / `u16` / `u32` / `u64` 登记为
+  关键字后，`src/bootstrap.wei` 的 `Code::u8` 等定义与调用被拒，stage0 重建
+  stage1 时断在 `bootstrap.wei:1117`。现仅在 `::` 之后把宽度关键字按普通
+  标识符处理，类型位置与其它语法不受影响
 
 ### Changed
 
 - README 补充 Make 构建方式、社区文档链接与子集自举章节
 - README 完善文言文扫雷示例的玩法、规则、棋盘符号与示例局面
+- README 新增「错误处理与诊断」章节（Result / `?`、传播链、错误码手册与验收），
+  并在选项表登记 `-no-error-trace`
 - 清理已不存在的扫雷示例引用
+
+### Known Issues
+
+- `make bootstrap-fixpoint` 目前仍失败：自举源码 `src/bootstrap.wei` 中还有
+  其它标识符与关键字表冲突（如参数名 `target`，见 `bootstrap.wei:1175`），
+  stage0 无法重建 stage1。关键字表扩展后与 4004 行自举源码共有 57 个重合词，
+  需要把保留字改为上下文敏感关键字，或系统性重命名自举源码里的标识符，
+  属于独立的一期工作。`tests/bootstrap/run.ps1`（10/10）与
+  `tests/rustplus/run.ps1`（19/19）不受影响。
+- `tests/bootstrap/cli.ps1`（不带 `-RequireBuildSuccess`）目前 14/20：
+  `build-done-text` 期望 `[done]` 而 CLI 输出 `[完成]`；`std-zh` /
+  `std-wenyan` / `-target linux` / `-wide` 四条期望"被拒绝"，但三种方言、
+  linux64 目标与 128 位宽算术现已是正式支持的选项；`o-missing-value`
+  反映 `-o` 缺参数时缺少校验。均为子集冻结时期留下的过时期望，
+  与本批次改动无关。
 
 ## [0.02.74282] - 2026-10-26
 
