@@ -367,9 +367,13 @@ GitHub 令牌：
 
 ```bash
 npm config set @wei-foundation:registry https://npm.pkg.github.com
-npm config set //npm.pkg.github.com/:_authToken <GitHub PAT>
+npm config set //npm.pkg.github.com/:_authToken 这里换成你的PAT
 npm install -g @wei-foundation/mtg
 ```
+
+注意这是**二选一**的备用方案：一旦把 `@wei-foundation:registry` 指向
+`npm.pkg.github.com`，按包名安装就只会走 GitHub Packages。想回到公共仓库，
+执行 `npm config delete @wei-foundation:registry`。
 
 **免令牌安装**：[Mtg Stable Channel](https://github.com/Wei-Foundation/mtg/releases/tag/Mtg-Stable-Channel)
 页面同时提供 `wei-foundation-mtg-0.9.4.tgz` 附件，任何人可直接安装，
