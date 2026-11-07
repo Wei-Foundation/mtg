@@ -344,21 +344,41 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\rustplus\run.ps1
 
 ## 通过 npm 安装
 
-包名 [`@wei-foundation/mtg`](https://www.npmjs.com/package/@wei-foundation/mtg)，
-安装后提供 `mtg` 命令，参数与直接使用 `mtg.exe` 完全一致：
+包名 `@wei-foundation/mtg`，安装后提供 `mtg` 命令，参数与直接使用
+`mtg.exe` 完全一致。包由 `.github/workflows/publish-ghpkg.yml` 发布到
+**GitHub Packages**（`npm.pkg.github.com`）：GitHub Actions 用自带
+`GITHUB_TOKEN` 并授予 `packages: write` 完成推送，不受 npmjs.com 两步验证
+发布限制的影响。
+
+从该源按包名安装需要带 `read:packages` 权限的 GitHub 令牌：
 
 ```bash
+npm config set @wei-foundation:registry https://npm.pkg.github.com
+npm config set //npm.pkg.github.com/:_authToken <GitHub PAT>
 npm install -g @wei-foundation/mtg
 mtg --version
 mtg build hello.wei -o hello.exe
 mtg explain E0277
 ```
 
-包内自带 Windows x64 预编译的 `vendor/mtg.exe`，与
-[Mtg Stable Channel](https://github.com/Wei-Foundation/mtg/releases/tag/Mtg-Stable-Channel)
-附件的字节一致；CLI 会原样透传退出码，因此 `?` 传播链与非零错误码在 npm
-安装方式下同样有效。Linux x64 或希望使用最新源码时，可用随包附带的
-`src/main.cpp` 本地构建：
+**免令牌安装**：[Mtg Stable Channel](https://github.com/Wei-Foundation/mtg/releases/tag/Mtg-Stable-Channel)
+页面同时提供 `wei-foundation-mtg-0.9.4.tgz` 附件，任何人可直接安装，
+无需账号或令牌：
+
+```bash
+npm install -g https://github.com/Wei-Foundation/mtg/releases/download/Mtg-Stable-Channel/wei-foundation-mtg-0.9.4.tgz
+```
+
+在本机仓库内也可以直接用 `npm pack` 产出的 tarball：
+
+```bash
+npm install -g H:\mtg\wei-foundation-mtg-0.9.4.tgz
+```
+
+包内自带 Windows x64 预编译的 `vendor/mtg.exe`，与 Release 附件字节一致；
+CLI 会原样透传退出码，因此 `?` 传播链与非零错误码在 npm 安装方式下同样
+有效。Linux x64 或希望使用最新源码时，可用随包附带的 `src/main.cpp`
+本地构建：
 
 ```bash
 npm run build:compiler   # 需要支持 C++26 的 GCC / Clang
@@ -371,8 +391,6 @@ npm install
 npm test                 # 冒烟测试：mtg --version
 npm pack                 # 生成 wei-foundation-mtg-0.9.4.tgz
 ```
-
-> 发布 scope 包需要 npm 账号拥有 `@wei-foundation` 组织权限。
 
 ---
 
