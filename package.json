@@ -1,0 +1,41 @@
+{
+  "name": "@wei-foundation/mtg",
+  "version": "0.9.4",
+  "description": "维语言（Wei）原生编译器 MTG 的 npm 分发包，直接生成 x86-64 原生程序",
+  "license": "GPL-3.0-only",
+  "homepage": "https://github.com/Wei-Foundation/mtg#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Wei-Foundation/mtg.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Wei-Foundation/mtg/issues"
+  },
+  "keywords": [
+    "wei",
+    "mtg",
+    "compiler",
+    "native",
+    "x86-64",
+    "维语言"
+  ],
+  "bin": {
+    "mtg": "bin/mtg.js"
+  },
+  "files": [
+    "bin/",
+    "vendor/",
+    "scripts/",
+    "src/main.cpp",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build:compiler": "node scripts/build.js",
+    "test": "node scripts/smoke.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

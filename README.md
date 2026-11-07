@@ -20,6 +20,7 @@
 - [语言示例](#语言示例)
   - [文言文扫雷](#文言文扫雷)
 - [错误处理与诊断](#错误处理与诊断)
+- [通过 npm 安装](#通过-npm-安装)
 - [从源码构建](#从源码构建)
 - [子集自举（进行中）](#子集自举进行中)
 - [项目结构](#项目结构)
@@ -338,6 +339,40 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\rustplus\run.ps1
 
 该脚本覆盖错误码手册、Ok/Err 两条路径、两层传播链、关闭开关以及 `E0277`
 精确诊断共 19 项断言。
+
+---
+
+## 通过 npm 安装
+
+包名 [`@wei-foundation/mtg`](https://www.npmjs.com/package/@wei-foundation/mtg)，
+安装后提供 `mtg` 命令，参数与直接使用 `mtg.exe` 完全一致：
+
+```bash
+npm install -g @wei-foundation/mtg
+mtg --version
+mtg build hello.wei -o hello.exe
+mtg explain E0277
+```
+
+包内自带 Windows x64 预编译的 `vendor/mtg.exe`，与
+[Mtg Stable Channel](https://github.com/Wei-Foundation/mtg/releases/tag/Mtg-Stable-Channel)
+附件的字节一致；CLI 会原样透传退出码，因此 `?` 传播链与非零错误码在 npm
+安装方式下同样有效。Linux x64 或希望使用最新源码时，可用随包附带的
+`src/main.cpp` 本地构建：
+
+```bash
+npm run build:compiler   # 需要支持 C++26 的 GCC / Clang
+```
+
+在本仓库内开发或打包：
+
+```bash
+npm install
+npm test                 # 冒烟测试：mtg --version
+npm pack                 # 生成 wei-foundation-mtg-0.9.4.tgz
+```
+
+> 发布 scope 包需要 npm 账号拥有 `@wei-foundation` 组织权限。
 
 ---
 

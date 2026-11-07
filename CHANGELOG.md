@@ -35,6 +35,11 @@
   Rust 风格的错误返回不再静默失败
 - `tests/rustplus/` 验收套件：`ok.wei`、`trace.wei`、`e0277.wei` 与 `run.ps1`，
   覆盖手册、Ok/Err 路径、两层传播链、关闭开关与精确诊断共 19 项断言
+- npm 分发包 `@wei-foundation/mtg`（0.9.4）：提供 `mtg` CLI，原样透传参数、
+  标准输入输出与退出码；自带 Windows x64 预编译二进制 `vendor/mtg.exe`
+  （与 Mtg Stable Channel Release 附件字节一致），其他平台可用随包附带的
+  `src/main.cpp` 执行 `npm run build:compiler` 构建；另含 `npm test` 冒烟测试
+  与 `npm pack` 打包白名单
 
 ### Fixed
 
