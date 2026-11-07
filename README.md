@@ -345,20 +345,30 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\rustplus\run.ps1
 ## 通过 npm 安装
 
 包名 `@wei-foundation/mtg`，安装后提供 `mtg` 命令，参数与直接使用
-`mtg.exe` 完全一致。包由 `.github/workflows/publish-ghpkg.yml` 发布到
-**GitHub Packages**（`npm.pkg.github.com`）：GitHub Actions 用自带
-`GITHUB_TOKEN` 并授予 `packages: write` 完成推送，不受 npmjs.com 两步验证
-发布限制的影响。
+`mtg.exe` 完全一致。0.9.4 已发布到 **npmjs.com 公共仓库**，无需账号、令牌
+或任何 registry 配置：
 
-从该源按包名安装需要带 `read:packages` 权限的 GitHub 令牌：
+```bash
+npm install -g @wei-foundation/mtg
+```
+
+```bash
+mtg --version
+mtg build hello.wei -o hello.exe
+mtg explain E0277
+```
+
+用 `npm view @wei-foundation/mtg version` 可校验发布状态，应返回 `0.9.4`。
+
+**备用源**：`.github/workflows/publish-ghpkg.yml` 用 GitHub Actions 的
+`GITHUB_TOKEN`（`packages: write`）把同一版本发布到 **GitHub Packages**
+（`npm.pkg.github.com`）。从该源按包名安装需要带 `read:packages` 权限的
+GitHub 令牌：
 
 ```bash
 npm config set @wei-foundation:registry https://npm.pkg.github.com
 npm config set //npm.pkg.github.com/:_authToken <GitHub PAT>
 npm install -g @wei-foundation/mtg
-mtg --version
-mtg build hello.wei -o hello.exe
-mtg explain E0277
 ```
 
 **免令牌安装**：[Mtg Stable Channel](https://github.com/Wei-Foundation/mtg/releases/tag/Mtg-Stable-Channel)

@@ -40,9 +40,12 @@
   （与 Mtg Stable Channel Release 附件字节一致），其他平台可用随包附带的
   `src/main.cpp` 执行 `npm run build:compiler` 构建；另含 `npm test` 冒烟测试
   与 `npm pack` 打包白名单
+- `@wei-foundation/mtg@0.9.4` 已发布到 npmjs.com 公共仓库（`latest`），
+  `npm install -g @wei-foundation/mtg` 可直接安装，无需账号或令牌；
+  首次发布由具有「绕过两步验证」权限的 granular access token 完成
 - `.github/workflows/publish-ghpkg.yml`：用 GitHub Actions 的 `GITHUB_TOKEN`
-  （`packages: write`）把 `@wei-foundation/mtg` 发布到 GitHub Packages，
-  绕开 npmjs.com 的两步验证发布限制；Mtg Stable Channel Release 同时附带
+  （`packages: write`）把同一版本发布到 GitHub Packages，作为备用源
+  （该源需要 `read:packages` 令牌）；Mtg Stable Channel Release 同时附带
   `wei-foundation-mtg-0.9.4.tgz`，供无需令牌的安装方式使用
 
 ### Fixed
