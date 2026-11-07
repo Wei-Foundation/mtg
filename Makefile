@@ -20,7 +20,7 @@ ERRNULL := 2>/dev/null
 RUN     := ./$(TARGET)
 endif
 
-.PHONY: all check bootstrap-check bootstrap-fixpoint clean
+.PHONY: all check emit-check bootstrap-check bootstrap-fixpoint clean
 
 all: $(TARGET)
 
@@ -29,6 +29,10 @@ $(TARGET): $(SRC) Makefile
 
 check: $(TARGET)
 	$(RUN) --version
+
+# Windows only: regression for do.emit:: line-break markers.
+emit-check: $(TARGET)
+	powershell -NoProfile -ExecutionPolicy Bypass -File tests/emit/run.ps1
 
 # Windows only: run the 10 bootstrap subset acceptance programs with stage0.
 bootstrap-check: $(TARGET)

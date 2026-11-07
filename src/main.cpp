@@ -5369,7 +5369,13 @@ Stmt Parser::parseOutputStmt() {
 			pos_++;
 			auto nl = std::make_unique<Expr>();
 			StrLit sl;
-			sl.value = "\n";
+			/* BUGFIX: do.emit:: 的每个输出值都由后端用 "%s\n" / "%lld\n" /
+			   "%g\n" 打印，末尾那一个换行是后端补的（见 emitDataPrologue
+			   的 strfmt）。换行标记若再塞一个 "\n"，printf("%s\n", "\n")
+			   就会打印两个换行，写一次 outlb 却空两行。这里用空串：
+			   printf("%s\n", "") 恰好只产生一次换行，且 win64 与 linux64
+			   两种后端行为一致。 */
+			sl.value = "";
 			*nl = std::move(sl);
 			o.values.push_back(std::move(nl));
 		} else {

@@ -40,6 +40,7 @@
   （与 Mtg Stable Channel Release 附件字节一致），其他平台可用随包附带的
   `src/main.cpp` 执行 `npm run build:compiler` 构建；另含 `npm test` 冒烟测试
   与 `npm pack` 打包白名单
+- `tests/emit/` 与 `make emit-check`：`do.emit::` 换行标记的字节级回归用例
 - `@wei-foundation/mtg@0.9.4` 已发布到 npmjs.com 公共仓库（`latest`），
   `npm install -g @wei-foundation/mtg` 可直接安装，无需账号或令牌；
   首次发布由具有「绕过两步验证」权限的 granular access token 完成
@@ -50,6 +51,11 @@
 
 ### Fixed
 
+- `do.emit::` 的换行标记（`outlb` / `newline` / 中文 `换行`）原先被解析成
+  字符串常量 `"\n"`，而每个输出值后端都用 `"%s\n"` 打印，于是
+  `printf("%s\n", "\n")` 一次打印两个换行：写一次 `outlb` 却空两行。
+  现改为空串常量，一次标记恰好产生一次换行，win64 / linux64 一致。
+  新增 `tests/emit/` 字节级回归用例与 `make emit-check`
 - stage1 的 `/`、`%` 除零检查原先测试被除数（RCX）而不是除数（RAX），
   导致 `0 / 256`、`0 % 256` 被误判为除零；修正为 `test rax` 后再交换操作数，
   `bootstrap2.exe` 不再在 `Mem::store64` 等路径 panic
@@ -86,6 +92,10 @@
 
 ### Known Issues
 
+- 上面的 `outlb` 修复目前在源码与本机 `mtg.exe` 中生效，但已发布的
+  `@wei-foundation/mtg@0.9.4` tarball、Mtg Stable Channel Release 的
+  `mtg.exe` / `.tgz` 以及仓库内 `vendor/mtg.exe` 仍是修复前的二进制。
+  下次发版（0.9.5）需同步重建这四处；源码构建的用户不受影响。
 - `make bootstrap-fixpoint` 目前仍失败：自举源码 `src/bootstrap.wei` 中还有
   其它标识符与关键字表冲突（如参数名 `target`，见 `bootstrap.wei:1175`），
   stage0 无法重建 stage1。关键字表扩展后与 4004 行自举源码共有 57 个重合词，
