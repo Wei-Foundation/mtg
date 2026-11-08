@@ -33,7 +33,18 @@ jobs:
       - name: Verify package contents
         run: npm pack --dry-run
 
-      - name: Publish
-        run: npm publish
+      # 同一个版本号已在 GitHub Packages 时，npm publish 会返回 403。
+      # 重建二进制这类只改内容、不改版本号的推送不应该让 CI 变红。
+      - name: Publish (idempotent)
+        run: |
+          set +e
+          out=$(npm publish 2>&1)
+          rc=$?
+          printf '%s\n' "$out"
+          if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qiE 'cannot publish over existing version|E403|403 Forbidden|already exists'; then
+            echo "::notice::Version already in GitHub Packages; skipping."
+            exit 0
+          fi
+          exit "$rc"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

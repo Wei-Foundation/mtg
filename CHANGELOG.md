@@ -38,7 +38,12 @@
 - 清理仓库根目录的 `hello.*`、`src/main.exe`、旧 tarball、
   `package-lock.json` 与 `node_modules/`，并在 `.gitignore` 加上对应规则
 - npm 包版本 0.9.4 → 0.9.5；`vendor/mtg.exe` 与 `mtg.exe` 重新构建，
-  SHA256 `982d8936…9887`，两处字节一致
+  两处字节一致。2026-11-08 晚又按用户要求从同一份源码整体重编译了一次
+  （源码未改，PE COFF 时间戳导致字节不同），当前 SHA256
+  `0361e539e923da9e868deb42bf27dca9c5645b9b1a87a60ee2b03a055471687e`；
+  tarball 与 Release 附件同步重建
+- `.github/workflows/publish-ghpkg.yml` 的发布步骤改为幂等：版本号已存在于
+  GitHub Packages 时跳过而不是让 CI 变红（重建二进制不改版本号的推送场景）
 
 ---
 
