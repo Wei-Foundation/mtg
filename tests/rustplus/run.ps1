@@ -6,6 +6,9 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+# MTG writes UTF-8; PS 5.1 otherwise decodes native stdout with the OEM
+# codepage and every Chinese label turns into mojibake.
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $mtg = (Resolve-Path $Compiler).Path
 $dir = $PSScriptRoot
 $tmp = Join-Path $env:TEMP 'mtg_rustplus'
@@ -27,6 +30,10 @@ Check ($codes -match 'E0277') '--list-codes includes E0277' ''
 $explain = (& $mtg explain E0277 2>&1 | Out-String)
 Check ($explain -match 'Main::main\(\)\.Result') 'explain E0277 shows a compilable fix' ''
 Check ($explain -match 'Result-returning') 'explain E0277 has an English title' ''
+# Unicode escapes keep this file ASCII-only for Windows PowerShell 5.1.
+$pipeline = (& $mtg --pipeline 2>&1 | Out-String)
+Check ($pipeline -match '\u7f16\u8bd1\u6d41\u7a0b') '--pipeline explains the compile pipeline' ''
+Check ($pipeline -match '\[8/8\]') '--pipeline lists all 8 phases' ''
 
 Write-Host '[2] Ok path (no error)'
 & $mtg build (Join-Path $dir 'ok.wei') -o (Join-Path $tmp 'ok.exe') | Out-Null
@@ -66,6 +73,12 @@ Check ($eCode -ne 0) 'e0277.wei is rejected' "exit=$eCode"
 Check ($eOut -match 'error\[E0277\]') 'diagnostic carries error code E0277' "out=[$($eOut.Trim())]"
 Check ($eOut -match 'explain E0277') 'diagnostic points at the handbook' ''
 Check ($eOut -match '\^') 'diagnostic underlines the ? token' ''
+Check ($eOut -match '= \u6765\u6e90:') 'diagnostic states the file origin' ''
+Check ($eOut -match '= \u9884\u5224:') 'diagnostic predicts the likely intent' ''
+Check ($eOut -match '= \u9636\u6bb5:') 'diagnostic names the failing phase' ''
+Check ($eOut -match '= \u6d41\u7a0b:') 'diagnostic shows the whole pipeline' ''
+Check ($eOut -match '= \u7ee7\u7eed:') 'diagnostic tells how to continue' ''
+Check ($eOut -match '\[6/8\]') 'Result constraint is attributed to phase 6' ''
 
 Write-Host ''
 if ($fail -eq 0) {

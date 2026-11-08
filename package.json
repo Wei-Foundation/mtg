@@ -1,6 +1,6 @@
 {
   "name": "@wei-foundation/mtg",
-  "version": "0.9.4",
+  "version": "0.9.5",
   "description": "维语言（Wei）原生编译器 MTG 的 npm 分发包，直接生成 x86-64 原生程序",
   "license": "GPL-3.0-only",
   "homepage": "https://github.com/Wei-Foundation/mtg#readme",

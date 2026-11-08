@@ -2,7 +2,47 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 的格式，版本号沿用编译器 `--version` 输出的版本号。
 
-## [Unreleased]
+## [0.9.5] - 2026-11-08
+
+### Added
+
+- 诊断信息增强：标题与错误码**粗体**、`-->` 文件名与「来源」绝对路径
+  加**下划线**、源码行里真正出错的片段也加下划线（终端 VT 模式；
+  管道 / CI / `NO_COLOR` 下自动降级为纯文本）
+- 每条诊断新增四行：`= 来源:`（绝对路径、总行数、主源文件 / 导入模块）、
+  `= 预判:`（最可能的真实意图）、`= 阶段:` 与 `= 流程:`（8 步编译流程里
+  停在哪一步）、`= 继续:`（修复后重跑的命令）
+- 预判会扫描源码里已声明的变量、关键字表与内置函数，按编辑距离给出
+  最接近的候选（例如 `coumt` → `count`）
+- `mtg --pipeline`：完整编译流程、每步职责与相关选项；
+  `mtg build ... --verbose`：实时打印 8 个阶段进度；
+  `-no-color` / `-color` 显式控制配色
+- `tests/rustplus/run.ps1` 扩到 25 项断言，覆盖 `--pipeline` 与新增的
+  来源 / 预判 / 阶段 / 流程 / 继续 五行；脚本显式把输出编码设为 UTF-8
+
+### Fixed
+
+- `do.emit::` 的 `outlb` / `newline` / `换行` 一次换两行（见 0.9.4 Known Issues
+  中记录的成因），改为空串输出值后一次标记恰好一次换行；
+  新增 `tests/emit/` 字节级回归与 `make emit-check`
+- Windows 下 ANSI 序列在非 VT 控制台会变成乱码：现在自动检测 TTY 并开启
+  `ENABLE_VIRTUAL_TERMINAL_PROCESSING`，非终端时完全不输出控制序列
+- 恢复被误删的 `saolei.wenyan.wei`（311 行，已用当前编译器验证可构建），
+  README 里的扫雷章节不再是死链
+
+### Changed
+
+- README 全面校正：补全目录、修正 macOS 相关错误描述、补齐 `build` 全选项与
+  子命令表、新增「诊断信息结构」章节、把自举状态与 Known Issues 对齐、
+  项目结构补上 npm / 测试 / workflow 目录
+- 清理仓库根目录的 `hello.*`、`src/main.exe`、旧 tarball、
+  `package-lock.json` 与 `node_modules/`，并在 `.gitignore` 加上对应规则
+- npm 包版本 0.9.4 → 0.9.5；`vendor/mtg.exe` 与 `mtg.exe` 重新构建，
+  SHA256 `982d8936…9887`，两处字节一致
+
+---
+
+## [0.9.4] - 2026-11-07
 
 ### Added
 
@@ -92,10 +132,6 @@
 
 ### Known Issues
 
-- 上面的 `outlb` 修复目前在源码与本机 `mtg.exe` 中生效，但已发布的
-  `@wei-foundation/mtg@0.9.4` tarball、Mtg Stable Channel Release 的
-  `mtg.exe` / `.tgz` 以及仓库内 `vendor/mtg.exe` 仍是修复前的二进制。
-  下次发版（0.9.5）需同步重建这四处；源码构建的用户不受影响。
 - `make bootstrap-fixpoint` 目前仍失败：自举源码 `src/bootstrap.wei` 中还有
   其它标识符与关键字表冲突（如参数名 `target`，见 `bootstrap.wei:1175`），
   stage0 无法重建 stage1。关键字表扩展后与 4004 行自举源码共有 57 个重合词，

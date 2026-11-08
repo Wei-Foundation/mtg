@@ -4,6 +4,7 @@
 /bootstrap.exe
 /bootstrap2.exe
 /bootstrap3.exe
+/saolei.exe
 *.o
 *.obj
 *.pdb
@@ -11,9 +12,18 @@
 *.exp
 *.lib
 *.log
+*.mod
 build/
 dist/
 out/
+
+# 随手测试与临时产物（examples 里的 .wei 是刻意保留的用例）
+/hello.wei
+/hello.exe
+/src/*.exe
+/tests/**/*.exe
+/tests/**/*.out
+*.tmp
 
 # npm 打包与依赖
 *.tgz

@@ -54,6 +54,12 @@
 #include <unistd.h>
 #include <climits>
 #include <cctype>
+#include <cstdlib>
+#include <filesystem>
+#if defined(_WIN32) && !defined(ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+/* 老版本 MinGW 头文件可能没有这个定义 */
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
 
 /* ==========================================================================
  * 128 位整数 wei_i128
@@ -1559,17 +1565,82 @@ namespace wei::diag {
 	inline bool& colorFlag() { static bool b = true; return b; }
 	inline bool useColor() { return colorFlag(); }
 	inline void setColorEnabled(bool v) { colorFlag() = v; }
+	inline bool& verboseFlag() { static bool b = false; return b; }
+	inline void setVerbose(bool v) { verboseFlag() = v; }
 
-	/* 自动检测: 非 TTY 或 NO_COLOR 时关色 */
+	/* 自动检测：非 TTY 或 NO_COLOR 时关色；Windows 必须显式打开 VT 模式，
+	   否则 ANSI 序列会在 conhost 里显示成 ←[1m 之类的乱码。
+	   关色后所有诊断都是纯文本，CI / 重定向 / 测试脚本不会混入 ESC。 */
 	inline void detectColor() {
 		const char* nc = std::getenv("NO_COLOR");
 		if (nc && nc[0] != '\0') { colorFlag() = false; return; }
 		if (std::getenv("WEI_FORCE_COLOR")) { colorFlag() = true; return; }
-#ifdef _WIN32
-		colorFlag() = true;
+#if defined(_WIN32)
+		HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+		DWORD mode = 0;
+		bool tty = (h != nullptr && h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode) != 0);
+		if (tty && !(mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
+			if (!SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) tty = false;
+		}
+		colorFlag() = tty;
 #else
 		colorFlag() = (isatty(STDERR_FILENO) != 0);
 #endif
+	}
+
+	/* ── 编译流程：错误发生在哪一步、整体是怎么编译的 ─────────────────── */
+	struct PhaseInfo {
+		const char* id;
+		const char* zh;
+		const char* detail;
+	};
+	inline const std::vector<PhaseInfo>& pipeline() {
+		static const std::vector<PhaseInfo> v = {
+			{"read",    "读取源文件",   "按二进制读入 .wei，记录源目录供 import / requires 就近查找"},
+			{"norm",    "方言改写",     "中文 / 文言 → wei27；-emit-norm:<文件> 导出改写结果"},
+			{"lex",     "词法分析",     "字符流 → token 流；非法字节、未闭合字符串在此拦下"},
+			{"parse",   "语法分析",     "token 流 → AST；顶层声明、表达式与 '?' 位置在此确定"},
+			{"mono",    "单态化求值",   "泛型实例化、编译期确定性循环折叠"},
+			{"types",   "类型与可见性", "类型推导、export / fileprivate 判定、Result 约束"},
+			{"codegen", "代码生成",     "AST → x86-64 机器码；注入 '?' 传播站点与运行时桩"},
+			{"final",   "封装写盘",     "PE32+ / ELF64 头、重定位、导入表，写出可执行文件"},
+		};
+		return v;
+	}
+	inline std::string& phaseId() { static std::string s = "read"; return s; }
+	inline std::string& mainFileRef() { static std::string s; return s; }
+	inline void setMainFile(const std::string& s) { mainFileRef() = s; }
+	inline int phaseIndex(const std::string& id) {
+		const auto& p = pipeline();
+		for (size_t i = 0; i < p.size(); i++) if (id == p[i].id) return static_cast<int>(i);
+		return 0;
+	}
+	inline const PhaseInfo& currentPhase() { return pipeline()[static_cast<size_t>(phaseIndex(phaseId()))]; }
+	inline void setPhase(const char* id) {
+		phaseId() = id;
+		if (!verboseFlag()) return;
+		const auto& p = pipeline();
+		int i = phaseIndex(id);
+		std::fprintf(stderr, "  %s[%d/%zu] %s%s - %s\n",
+		             useColor() ? "\033[36m" : "", i + 1, p.size(),
+		             p[static_cast<size_t>(i)].zh, useColor() ? "\033[0m" : "",
+		             p[static_cast<size_t>(i)].detail);
+	}
+	/* 一行式流程图：当前阶段用方括号标出，一眼看出编译走到哪一步停下。 */
+	inline std::string pipelineSummary() {
+		const auto& p = pipeline();
+		int cur = phaseIndex(phaseId());
+		std::ostringstream o;
+		for (int i = 0; i < static_cast<int>(p.size()); i++) {
+			if (i) o << " -> ";
+			o << (i == cur ? "[" : "") << p[static_cast<size_t>(i)].zh << (i == cur ? "]" : "");
+		}
+		return o.str();
+	}
+	inline std::string absolutePath(const std::string& p) {
+		if (p.empty() || p == "<unknown>") return p;
+		try { return std::filesystem::absolute(p).lexically_normal().string(); }
+		catch (...) { return p; }
 	}
 
 	/* ── 显示宽度: CJK/全角算 2 列 ───────────────────────────────────── */
@@ -1697,6 +1768,19 @@ namespace wei::diag {
 		std::vector<std::string> lines_;
 	};
 
+	/* 从源码里粗提取已声明的变量名，供"你是不是想写 count"这类预判使用。
+	   只做文本级扫描、不依赖 AST —— 报错时 AST 往往还没建起来。 */
+	inline std::vector<std::string> declaredNames(const SourceCache& src) {
+		static const std::regex re(R"(\bcreate\.(?:int|double|char|bool|auto|omni)\s+([A-Za-z_]\w*))");
+		std::vector<std::string> v;
+		for (int i = 1; i <= src.lineCount(); i++) {
+			std::string s = src.line(i);
+			for (std::sregex_iterator it(s.begin(), s.end(), re), end; it != end; ++it)
+				v.push_back((*it)[1].str());
+		}
+		return v;
+	}
+
 	/* ── 诊断结构 ────────────────────────────────────────────────────── */
 	enum class Severity { Error, Warning, Note, Help };
 
@@ -1719,6 +1803,9 @@ namespace wei::diag {
 		std::vector<Label> labels;   /* 至少一个；primary 决定主标注 */
 		std::vector<std::string> notes;
 		std::vector<std::string> helps;
+		std::string prediction;      /* 预判：最可能的真实意图 */
+		std::string origin;          /* 文件来源说明；空则按 src.fileName() 推断 */
+		std::string phase;           /* 显式指定的编译阶段；空则用全局阶段 */
 
 		void label(Span sp, const std::string& m, bool isPrimary = false) {
 			labels.push_back({sp, m, isPrimary});
@@ -1785,19 +1872,31 @@ namespace wei::diag {
 
 	/* ── 错误分类与"你是不是想写"建议 ────────────────────────────────── */
 
-	/* 从消息里抽取单引号内的名字 */
+	/* 从消息里抽取名字：优先单引号内的；没有引号时取冒号后的标识符。
+	   这样 "未声明标识符: coumt at 3:14" 也能拿到 coumt 做预判。 */
 	inline std::string extractQuoted(const std::string& msg) {
 		size_t a = msg.find('\'');
-		if (a == std::string::npos) return "";
-		size_t b = msg.find('\'', a + 1);
-		if (b == std::string::npos) return "";
-		return msg.substr(a + 1, b - a - 1);
+		if (a != std::string::npos) {
+			size_t b = msg.find('\'', a + 1);
+			if (b != std::string::npos) return msg.substr(a + 1, b - a - 1);
+		}
+		size_t c = msg.find(':');
+		size_t adv = 1;
+		if (c == std::string::npos) { c = msg.find("\xef\xbc\x9a"); adv = 3; }  /* 中文冒号 */
+		if (c == std::string::npos) return "";
+		c += adv;
+		while (c < msg.size() && std::isspace(static_cast<unsigned char>(msg[c]))) c++;
+		size_t e = c;
+		while (e < msg.size() && (std::isalnum(static_cast<unsigned char>(msg[e])) || msg[e] == '_')) e++;
+		if (e > c) return msg.substr(c, e - c);
+		return "";
 	}
 
 	struct Classified {
-		std::string code;      /* E0101 */
-		std::string labelMsg;  /* 标在 ^^^ 后面的话 */
+		std::string code;        /* E0101 */
+		std::string labelMsg;    /* 标在 ^^^ 后面的话 */
 		std::string help;
+		std::string prediction;  /* 预判：用户大概率想写什么 / 下一步做什么 */
 	};
 
 	/* 关键字候选由外部注入（避免 diag 依赖 Parser 内部表） */
@@ -1819,6 +1918,52 @@ namespace wei::diag {
 			"__file_open", "__file_close", "__file_write", "__read_file", "__write_file"
 		};
 		return v;
+	}
+
+	/* 只有形如标识符的名字才配做拼写推断。
+	   否则 "'?' 只能……" 里的 '?' 会被当成名字，预判成"你想写 'v'"。 */
+	inline bool isIdentifierLike(const std::string& s) {
+		if (s.size() < 2) return false;
+		unsigned char c0 = static_cast<unsigned char>(s[0]);
+		if (!(std::isalpha(c0) || s[0] == '_')) return false;
+		for (char ch : s)
+			if (!(std::isalnum(static_cast<unsigned char>(ch)) || ch == '_')) return false;
+		return true;
+	}
+
+	/* 预判：在 help 之外再给一条"你大概率是想……"的推断。
+	   优先级：拼写最接近的关键字/内置函数 > 按错误类别的固定推断。 */
+	inline std::string predictIntent(const std::string& name, const std::string& code,
+	                                 const std::vector<std::string>& extra = {}) {
+		if (isIdentifierLike(name)) {
+			std::vector<std::string> cands = keywordCandidates();
+			for (const auto& b : builtinNames()) cands.push_back(b);
+			for (const auto& x : extra) cands.push_back(x);
+			std::string best;
+			int bestD = INT_MAX;
+			for (const auto& c : cands) {
+				int d = editDistance(name, c);
+				if (d < bestD) { bestD = d; best = c; }
+			}
+			int limit = static_cast<int>(name.size()) / 3 + 1;
+			if (limit > 4) limit = 4;
+			if (!best.empty() && bestD <= limit && best != name)
+				return "你想写的很可能是 '" + best + "'（'" + name + "' 与它只差 "
+				     + std::to_string(bestD) + " 处编辑）";
+		}
+		if (code == "E0101") return "顶层只接受声明；大概率是把语句误写到了模块体外，或关键字拼错";
+		if (code == "E0102") return "这里缺一个操作数或运算符；检查是否把 '::' 写成了 ':' 或漏了右半边";
+		if (code == "E0103") return "多半是上一行漏了 ';'，或多写了一个 '::'；编译器到这一格才发现不对";
+		if (code == "E0104") return "括号或引号没配对；从报错行向上找最近的未闭合符号";
+		if (code == "E0201" || code == "E0202") return "依赖文件大概率在源文件同目录或 lib/ 下；检查文件名与大小写";
+		if (code == "E0203") return "被调模块需要 export；也可能本该是同文件内的直接调用";
+		if (code == "E0204") return "把公共声明抽到第三个模块，依赖就会重新变成单向";
+		if (code == "E0205") return "同名声明出现了两次；删掉一个或改名即可";
+		if (code == "E0425") return "名字未声明；检查是否漏写 create.int / create.mod，或大小写不一致";
+		if (code == "E0308") return "两侧类型不一致；统一声明类型或显式转换";
+		if (code == "E0277") return "把当前函数的返回类型改成 .Result，或去掉 '?' 并显式处理 Err";
+		if (code == "E0100") return "多半是字符串少了右引号，或混入了非法 UTF-8 字节";
+		return "按 help 行改完重新构建；mtg explain " + code + " 有可编译的修复示例";
 	}
 
 	inline Classified classify(const std::string& msg) {
@@ -1858,9 +2003,9 @@ namespace wei::diag {
 		} else if (has("重复定义")) {
 			c.code = "E0205";
 			c.labelMsg = "重复定义";
-		} else if (has("未定义") || has("Undefined")) {
-			c.code = "E0425";
-			c.labelMsg = "未定义的名字";
+	} else if (has("未定义") || has("未声明") || has("Undefined")) {
+		c.code = "E0425";
+		c.labelMsg = "未定义的名字";
 			if (!name.empty()) {
 				std::string s = suggestSimilar(name, keywordCandidates());
 				if (!s.empty()) c.help = "你是否想写 '" + s + "'？";
@@ -1889,12 +2034,13 @@ namespace wei::diag {
 			c.code = "E0104";
 			c.labelMsg = "括号或符号未闭合";
 			c.help = "检查配对的 ( ) { } [ ] 是否齐全";
-		} else {
-			c.code = "E0001";
-			c.labelMsg = "此处出错";
-		}
-		return c;
+	} else {
+		c.code = "E0001";
+		c.labelMsg = "此处出错";
 	}
+	c.prediction = predictIntent(name, c.code);
+	return c;
+}
 
 	/* ── 渲染 ────────────────────────────────────────────────────────── */
 
@@ -1933,6 +2079,38 @@ namespace wei::diag {
 		return d;
 	}
 
+	/* 给源码行里主标注覆盖的文本加真·下划线（ANSI SGR 4）。
+	   终端把控制序列渲染成 0 宽，下面那行 ^^^ 的对齐不受影响；
+	   关色时原样返回，保证重定向/CI 里是纯文本。
+	   at[c] = 显示列 c 对应的字节下标；宽字符占两列时中间列指向字符末尾，
+	   这样标注落在汉字中间也会吸附到字符边界而不是切坏 UTF-8。 */
+	inline std::string underlineInLine(const std::string& text, int startCol, int len) {
+		if (!useColor() || text.empty() || startCol < 0 || len <= 0) return text;
+		std::vector<size_t> at(1, 0);
+		size_t i = 0;
+		while (i < text.size()) {
+			uint32_t cp = 0;
+			int n = utf8Decode(text, i, cp);
+			i += static_cast<size_t>(n);
+			int w = codePointWidth(cp);
+			if (w <= 0) w = 1;
+			for (int k = 0; k < w; k++) at.push_back(i);
+		}
+		int c0 = startCol;
+		int c1 = startCol + len;
+		int maxCol = static_cast<int>(at.size()) - 1;
+		if (c0 > maxCol) return text;
+		if (c1 > maxCol) c1 = maxCol;
+		if (c1 <= c0) return text;
+		size_t b0 = at[static_cast<size_t>(c0)];
+		size_t b1 = at[static_cast<size_t>(c1)];
+		if (b1 <= b0 || b1 > text.size()) return text;
+		std::string out = text;
+		out.insert(b1, "\033[0m");
+		out.insert(b0, "\033[4m");
+		return out;
+	}
+
 	/* 渲染单条诊断 */
 	inline std::string render(const Diagnostic& d, const SourceCache& src) {
 		std::ostringstream o;
@@ -1945,6 +2123,7 @@ namespace wei::diag {
 		const std::string BMAG = "\033[1;35m";
 		const std::string BGRN = "\033[1;32m";
 		const std::string DIM = "\033[2m";
+		const std::string UND = "\033[4m";   /* 下划线：文件来源与出错的源码片段 */
 		const std::string R = "\033[0m";
 
 		auto B = [&](const std::string& s, const std::string& style) -> std::string {
@@ -1969,10 +2148,20 @@ namespace wei::diag {
 		for (auto& l : d.labels) if (l.primary) { prim = &l; break; }
 		if (!prim) prim = &d.labels[0];
 
-		/* 位置行 */
+		/* 位置行：文件名带下划线，一眼看出错误来自哪个文件 */
 		std::string loc = src.fileName().empty() ? "<unknown>" : src.fileName();
 		o << std::string(digitsOf(prim->span.line) + 1, ' ')
-		  << B("--> ", BCYN) << loc << ":" << prim->span.line << ":" << prim->span.col << "\n";
+		  << B("--> ", BCYN) << B(loc, UND) << ":" << prim->span.line << ":" << prim->span.col << "\n";
+
+		/* 文件来源：绝对路径 + 主源文件 / 导入模块 + 总行数。
+		   多文件编译里最常问的就是"这个错到底在哪个文件"。 */
+		{
+			std::string origin = d.origin.empty() ? loc : d.origin;
+			bool imported = !mainFileRef().empty() && loc != "<unknown>" && loc != mainFileRef();
+			o << "  " << B("= 来源: ", BCYN) << B(absolutePath(origin), UND)
+			  << "  (" << (imported ? "导入模块" : "主源文件")
+			  << ", 共 " << src.lineCount() << " 行)\n";
+		}
 
 		/* 收集涉及的源码行，排序去重 */
 		std::vector<int> rows;
@@ -1997,12 +2186,6 @@ namespace wei::diag {
 			std::vector<int> colMap;
 			std::string text = expandTabs(raw, colMap);
 
-			/* 分隔行 */
-			o << blankGutter() << B("|", BCYN) << "\n";
-
-			/* 源码行 */
-			o << " " << gutterStr(ln) << " " << B("|", BCYN) << " " << text << "\n";
-
 			/* 该行上的所有标注，按列排序 */
 			std::vector<const Label*> onRow;
 			for (auto& l : d.labels) if (l.span.line == ln) onRow.push_back(&l);
@@ -2010,6 +2193,23 @@ namespace wei::diag {
 				if (a->span.col != b->span.col) return a->span.col < b->span.col;
 				return a->primary && !b->primary;
 			});
+
+			/* 主标注的显示列范围，用来给源码里的那段文本加下划线 */
+			int primStart = -1, primLen = 0;
+			for (auto* l : onRow) if (l->primary) {
+				int rawIdx = l->span.col - 1;
+				if (rawIdx >= 0 && rawIdx < static_cast<int>(colMap.size())) primStart = colMap[rawIdx];
+				else if (!colMap.empty()) primStart = colMap.back();
+				primLen = l->span.len > 0 ? l->span.len : 1;
+				break;
+			}
+
+			/* 分隔行 */
+			o << blankGutter() << B("|", BCYN) << "\n";
+
+			/* 源码行：出错片段带下划线，下一行再用 ^ 精确定位 */
+			o << " " << gutterStr(ln) << " " << B("|", BCYN) << " "
+			  << underlineInLine(text, primStart, primLen) << "\n";
 
 			/* 画 underline。多标注共存时，用 occupancy 数组避免互相覆盖 */
 			std::vector<char> marks(displayWidth(text) + 2, ' ');
@@ -2084,6 +2284,36 @@ namespace wei::diag {
 		/* helps */
 		for (auto& h : d.helps) {
 			o << blankGutter() << B("= help: ", BGRN) << h << "\n";
+		}
+
+		/* 预判：在 help 之外，直接说"你大概率是想……"。
+		   若源码里能找到拼写相近的已声明变量，优先用那条更具体的推断。 */
+		{
+			std::string pred = d.prediction;
+			std::string name = extractQuoted(d.message);
+			if (!name.empty()) {
+				std::string better = predictIntent(name, d.code, declaredNames(src));
+				if (better.find("只差") != std::string::npos) pred = better;
+			}
+			if (pred.empty()) pred = predictIntent("", d.code);
+			o << blankGutter() << B("= 预判: ", BYEL) << pred << "\n";
+		}
+
+		/* 编译如何进行：停在哪一步、完整流程长什么样、修完怎么继续 */
+		{
+			std::string pid = d.phase.empty() ? phaseId() : d.phase;
+			int pi = phaseIndex(pid);
+			const PhaseInfo& ph = pipeline()[static_cast<size_t>(pi)];
+			o << blankGutter() << B("= 阶段: ", BCYN) << ph.zh
+			  << " [" << (pi + 1) << "/" << pipeline().size() << "] - " << ph.detail << "\n";
+			std::string saved = phaseId();
+			phaseId() = pid;
+			o << blankGutter() << B("= 流程: ", BCYN) << pipelineSummary() << "\n";
+			phaseId() = saved;
+			o << blankGutter() << B("= 继续: ", BGRN)
+			  << "修好后重新执行 mtg build "
+			  << (mainFileRef().empty() ? std::string("<文件.wei>") : mainFileRef())
+			  << "；完整流程见 mtg --pipeline\n";
 		}
 		return o.str();
 	}
@@ -2290,6 +2520,7 @@ create.mod Main::main().Result {
 		}
 		std::printf("\n  提示: mtg --list-codes 查看全部错误码；"
 		            "mtg build x.wei -no-error-trace 可关闭 '?' 传播链。\n");
+		std::printf("  编译流程与错误发生阶段：mtg --pipeline；构建时加 -v 可实时看阶段进度。\n");
 		return 0;
 	}
 
@@ -2301,6 +2532,30 @@ create.mod Main::main().Result {
 			std::printf("  %-7s %s  %s\n", d.code,
 			            padToWidth(d.title_zh, 30).c_str(), d.title_en);
 		std::printf("\n用法: mtg explain E0277   或   mtg --explain E0277\n");
+		return 0;
+	}
+
+	/* mtg --pipeline：把"编译如何进行"讲清楚，并说明每条会影响哪一步。 */
+	inline int printPipeline() {
+		const auto& p = pipeline();
+		const char* b = S("\033[1m");
+		const char* r = SOff();
+		std::printf("%sMTG 编译流程%s（%zu 步，全部在本机完成，无虚拟机/解释器）\n\n",
+		            b, r, p.size());
+		static const char* opts[] = {
+			"输入文件由命令行给出", "-std:<方言> / -emit-norm:<文件>",
+			"—", "—", "-no-opt 可关闭闭式解替换", "-check=<等级> 控制检查强度",
+			"-no-error-trace / -wide / -ir / -g", "-o <输出> / -target win64|linux64"
+		};
+		for (size_t i = 0; i < p.size(); i++) {
+			std::printf("  %s[%zu/%zu] %s%s\n", b, i + 1, p.size(), p[i].zh, r);
+			std::printf("        %s\n", p[i].detail);
+			std::printf("        相关选项: %s\n", opts[i]);
+		}
+		std::printf("\n流程: %s\n", pipelineSummary().c_str());
+		std::printf("\n构建时加 %s-v%s / %s--verbose%s 可实时打印阶段进度；\n"
+		            "出错时诊断会自动带上「来源 / 阶段 / 流程 / 继续」四行，指明停在哪一步。\n",
+		            b, r, b, r);
 		return 0;
 	}
 
@@ -2319,6 +2574,8 @@ create.mod Main::main().Result {
 	d.message = msg;
 	d.labels.push_back({{line, col, 1}, c.labelMsg.empty() ? "词法错误" : c.labelMsg, true});
 	if (!c.help.empty()) d.help(c.help);
+	d.prediction = c.prediction;
+	d.phase = "lex";
 	throw wei::diag::DiagnosticError(d);
 }
 //字面意??
@@ -3368,6 +3625,8 @@ const Token& Parser::expect(TokType t, const std::string& desc) {
 	if (len <= 0) len = 1;
 	d.labels.push_back({{at.line, at.col, len}, c.labelMsg, true});
 	if (!c.help.empty()) d.help(c.help);
+	d.prediction = c.prediction;
+	d.phase = "parse";
 	throw wei::diag::DiagnosticError(d);
 }
 [[noreturn]] void Parser::die(const std::string& msg) const {
@@ -9304,39 +9563,79 @@ namespace wei::front {
 
 namespace wei::front {
 
-	const char* kProgramName = "Module Target Generator";
-	const char* kProgramVersion = "0.02.74282";
-	const char* kLangName = "维语言（第一版）\\中文版维语言（第一版）\\文言文版维语言（第一版）";
-	const char* kPlatformLine = "架构平台：WindowsNT x86-64（主要） 和 Linux x86-64";
-	const char* kBuildUsage = "  通过命令：mtg build <file.wei> [-o out.exe] [-opt] 生成 x86-64 可执行文件";
-	const char* kMaxLangLine = "编译器最高支持到所有维语言的第一代版本，如需要使用更高版本的特性，请检查或更新你的编译器。";
+	// =========================================================================
+	// ANSI 样式：统一走 wei::diag 的颜色开关。
+	// 管道 / CI / NO_COLOR 下所有 C() 返回空串，日志里不会混进 ESC 序列；
+	// 真实控制台由 detectColor() 打开 VT 模式，粗体与下划线才真正生效。
+	// =========================================================================
+	static const char* CLR_RESET  = "\033[0m";
+	static const char* CLR_BOLD   = "\033[1m";
+	static const char* CLR_UNDER  = "\033[4m";
+	static const char* CLR_RED    = "\033[31m";
+	static const char* CLR_GREEN  = "\033[32m";
+	static const char* CLR_YELLOW = "\033[33m";
+	static const char* CLR_BLUE   = "\033[34m";
+	static const char* CLR_CYAN   = "\033[36m";
 
+	inline const char* C(const char* code) { return wei::diag::useColor() ? code : ""; }
+	inline const char* C0() { return wei::diag::useColor() ? CLR_RESET : ""; }
+
+	// =========================================================================
+	// 编译器基本信息 (保留英文核心，中文方言作为亮点)
+	// =========================================================================
+	const char* kProgramName    = "Module Target Generator"; // 直接叫 MTG，硬核且极简
+	const char* kProgramVersion = "0.02.74282 (Stable)";
+	const char* kLangName       = "Wei 27 (第一版) / 中文版 / 文言文版";
+	const char* kPlatformLine   = "Windows NT x86_64 [Primary] | Linux x86_64";
+	const char* kBuildUsage     = "mtg build <file.wei> [-o out.exe] [-opt]";
+	const char* kMaxLangLine    = "注：本编译器最高支持 Wei 27 第一代版本，如需更高版本特性，请检查或更新你的编译器。";
+
+	// =========================================================================
+	// 基础输出界面 (UI & UX)
+	// =========================================================================
+
+	// 打印版本 (对应 mtg --version)
 	void printVersion(const std::string& backend) {
-		std::printf("%s %s - %s\n", kProgramName, kProgramVersion, kLangName);
-		std::printf("%s\n", kPlatformLine);
-		std::printf("%s\n", kBuildUsage);
-		std::printf("后端检测: %s\n", backend.c_str());
+		std::printf("%s%s%s - %s%s%s\n",
+			C(CLR_BOLD), kProgramName, C0(), C(CLR_CYAN), kProgramVersion, C0());
+		std::printf("%sDialects:%s %s\n", C(CLR_BOLD), C0(), kLangName);
+		std::printf("%sTargets :%s %s\n", C(CLR_BOLD), C0(), kPlatformLine);
+		std::printf("%sBackend :%s %s\n\n", C(CLR_BOLD), C0(), backend.c_str());
+		std::printf("%sUsage   :%s %s\n\n", C(CLR_BOLD), C0(), kBuildUsage);
 		std::printf("%s\n", kMaxLangLine);
 	}
 
+	// 无参数启动时显示 (对应直接敲 mtg)
 	void printStart() {
-		std::printf("%s - 维语言工具链 - 生成器\n", kProgramName);
-		std::printf("支持的编程方式： %s\n", kLangName);
+		std::printf("%s%s%s - v%s\n", C(CLR_BOLD), kProgramName, C0(), kProgramVersion);
+		std::printf("支持的方言: %s\n\n", kLangName);
+		std::printf("%s[ 错误 ] %s未发现输入文件与选项。\n", C(CLR_RED), C0());
+		std::printf("%s[ 提示 ]%s 你必须指定一个文件进行操作。\n", C(CLR_YELLOW), C0());
+		std::printf("          %smtg --pipeline%s 查看编译流程；%smtg --list-codes%s 查看错误码。\n",
+			C(CLR_BOLD), C0(), C(CLR_BOLD), C0());
 	}
 
+	// 编译成功提示
 	void printBuildOK(const std::string& outExe, const std::string& targetId) {
-		std::printf("[完成] %s (%s)\n", outExe.c_str(), targetId.c_str());
+		std::printf("%s[ 成功 ] %s已生成 %s%s%s (%s)\n",
+			C(CLR_GREEN), C0(), C(CLR_BOLD), outExe.c_str(), C0(), targetId.c_str());
 	}
 
+	// 基础错误打印
 	void printError(const std::string& msg) {
-		std::fprintf(stderr, "%s\n", msg.c_str());
+		std::fprintf(stderr, "%s[ 错误 ] %s%s\n", C(CLR_RED), C0(), msg.c_str());
 	}
+
+	// =========================================================================
+	// 诊断引擎 (Diagnostics & Tracing)
+	// =========================================================================
 
 	struct FrontLoc {
 		int line;
 		int col;
 		bool ok;
 	};
+
 	static FrontLoc frontExtractLoc(const std::string& msg) {
 		static const std::regex re(R"(at\s+(\d+):(\d+))");
 		std::smatch m;
@@ -9349,9 +9648,11 @@ namespace wei::front {
 	void emitError(const std::string& file, const std::string& raw) {
 		FrontLoc loc = frontExtractLoc(raw);
 		if (loc.ok) {
-			std::fprintf(stderr, "%s:%d:%d: %s\n", file.c_str(), loc.line, loc.col, raw.c_str());
+			std::fprintf(stderr, "%s%s:%d:%d: %s%s\n",
+				C(CLR_RED), file.c_str(), loc.line, loc.col, C0(), raw.c_str());
 		} else {
-			std::fprintf(stderr, "%s:?:?: %s\n", file.c_str(), raw.c_str());
+			std::fprintf(stderr, "%s%s:?:?: %s%s\n",
+				C(CLR_RED), file.c_str(), C0(), raw.c_str());
 		}
 	}
 
@@ -9363,23 +9664,47 @@ namespace wei::front {
 			wei::diag::emit(de->diag, sc);
 			return;
 		}
-		/* 非诊断异常: 至少把源码行打出来，别只有行列号 */
+
+		// 富诊断之外的异常：照样给出 来源 / 阶段 / 流程 / 继续 四行，
+		// 不能只剩一句光秃秃的 message。
 		FrontLoc loc = frontExtractLoc(e.what());
 		std::string msg = e.what();
+		wei::diag::SourceCache sc;
+		sc.loadFile(file);
+
 		if (loc.ok) {
-			wei::diag::SourceCache sc;
-			sc.loadFile(file);
 			std::string lineText = sc.line(loc.line);
-			std::fprintf(stderr, "%s:%d:%d: %s\n", file.c_str(), loc.line, loc.col, msg.c_str());
+			std::fprintf(stderr, "%s%s:%d:%d: %s%s\n",
+				C(CLR_RED), file.c_str(), loc.line, loc.col, C0(), msg.c_str());
 			if (!lineText.empty()) {
-				std::fprintf(stderr, "  %d | %s\n", loc.line, lineText.c_str());
+				std::fprintf(stderr, "  %s%4d |%s %s\n",
+					C(CLR_BLUE), loc.line, C0(), lineText.c_str());
+				std::fprintf(stderr, "       |%*s%s^%s\n", loc.col, "", C(CLR_RED), C0());
 			}
 		} else {
-			std::fprintf(stderr, "%s: %s\n", file.c_str(), msg.c_str());
+			std::fprintf(stderr, "%s%s: %s%s\n", C(CLR_RED), file.c_str(), C0(), msg.c_str());
 		}
+
+		std::fprintf(stderr, "  %s= 来源: %s%s%s  (主源文件, 共 %d 行)\n",
+			C(CLR_CYAN), C(CLR_UNDER), wei::diag::absolutePath(file).c_str(), C0(), sc.lineCount());
+		{
+			std::string name = wei::diag::extractQuoted(msg);
+			std::string code = wei::diag::classify(msg).code;
+			std::string pred = wei::diag::predictIntent(name, code, wei::diag::declaredNames(sc));
+			std::fprintf(stderr, "  %s= 预判: %s%s\n", C(CLR_YELLOW), pred.c_str(), C0());
+		}
+		int pi = wei::diag::phaseIndex(wei::diag::phaseId());
+		const auto& ph = wei::diag::currentPhase();
+		std::fprintf(stderr, "  %s= 阶段: %s%s [%d/%zu] - %s\n",
+			C(CLR_CYAN), ph.zh, C0(), pi + 1, wei::diag::pipeline().size(), ph.detail);
+		std::fprintf(stderr, "  %s= 流程: %s%s\n",
+			C(CLR_CYAN), wei::diag::pipelineSummary().c_str(), C0());
+		std::fprintf(stderr, "  %s= 继续: %s修好后重新执行 mtg build %s；完整流程见 mtg --pipeline\n",
+			C(CLR_GREEN), C0(), file.c_str());
 	}
 
 }  // namespace wei::front
+
 
 #endif // WEI_FRONTEND_NO_DEFS
 
@@ -15782,6 +16107,8 @@ void NativeGen::gen_yield_stmt(wei::ast::YieldStmt& n) {
 					d.labels.push_back({{t_line, t_col, 1}, "这个 '?' 无处传播错误", true});
 					d.help("把当前函数改为返回 .Result，或改用显式判断返回值是否 < 0");
 					d.help("运行 mtg explain E0277 查看完整说明与可编译的修复示例");
+					d.prediction = "把当前函数的返回类型改成 .Result，或去掉 '?' 并显式处理 Err";
+					d.phase = "types";   /* Result 约束属于类型/语义检查，虽在代码生成期兜底 */
 					throw wei::diag::DiagnosticError(d);
 				}
 				cl->has_try = false;
@@ -22593,6 +22920,7 @@ bool NativeGen::emit_for_rotated(ForStmt& n) {               /* init 已由调�
 			g_src_dir = (sl == std::string::npos) ? std::string(".") : file.substr(0, sl);
 		}
 
+		wei::diag::setPhase("read");
 		std::string src;
 		try {
 			src = readFile(file);
@@ -22605,6 +22933,7 @@ bool NativeGen::emit_for_rotated(ForStmt& n) {               /* init 已由调�
 		   在词法分析之前把文言/中文源码整体改写为 wei27 源码。
 		   放在这里而不是 Lexer 内部, 是因为改写要跨越词边界(语序重排),
 		   纯词法器做不到。 */
+		wei::diag::setPhase("norm");
 		if (dialect != WeiStd::Wei27) {
 			src = normalizeDialect(src, dialect);
 			/* -emit-norm:<文件>: 把改写后的 wei27 源码落盘。
@@ -22616,6 +22945,7 @@ bool NativeGen::emit_for_rotated(ForStmt& n) {               /* init 已由调�
 			}
 		}
 
+		wei::diag::setPhase("lex");
 		std::vector<Token> tokens;
 		try {
 			Lexer lex(std::move(src));
@@ -22654,6 +22984,7 @@ bool NativeGen::emit_for_rotated(ForStmt& n) {               /* init 已由调�
 			return p2;
 		};
 
+		wei::diag::setPhase("parse");
 		wei::ast::Program prog;
 		try {
 			auto ps = Parser(std::move(tokens));
@@ -22667,6 +22998,7 @@ bool NativeGen::emit_for_rotated(ForStmt& n) {               /* init 已由调�
 			return false;
 		}
 
+		wei::diag::setPhase("mono");
 		try {
 			wei::mono::monomorphize(prog);
 			wei::midstage::foldProgram(prog);   /* 处理端: 编译期求值确定性循环 */
@@ -22675,6 +23007,7 @@ bool NativeGen::emit_for_rotated(ForStmt& n) {               /* init 已由调�
 			return false;
 		}
 
+		wei::diag::setPhase("types");
 		try {
 			auto tc = wei::types::TypeChecker();
 			tc.check(prog);
@@ -22695,6 +23028,7 @@ bool NativeGen::emit_for_rotated(ForStmt& n) {               /* init 已由调�
 			ng.set_wide(true);
 			ng.set_ir(false);
 		}
+		wei::diag::setPhase("codegen");
 		std::vector<uint8_t> native;
 		try {
 			native = ng.generate();
@@ -22722,6 +23056,7 @@ bool NativeGen::emit_for_rotated(ForStmt& n) {               /* init 已由调�
 			emitException(file, e);
 			return false;
 		}
+		wei::diag::setPhase("final");
 		try {
 			target->finalize(ng, native, code_size, outputExe);
 		} catch (const std::exception& e) {
@@ -22751,6 +23086,12 @@ int main(int argc, char** argv) {
 	/* 诊断系统: 颜色按 TTY 自动开关（NO_COLOR / WEI_FORCE_COLOR 可覆盖），
 	   并把关键字表灌进建议器，用于"你是不是想写 xxx"。 */
 	wei::diag::detectColor();
+	/* 命令行显式关色优先于自动检测；构建脚本/CI 可直接加 -no-color。 */
+	for (int i = 1; i < argc; i++) {
+		std::string a(argv[i]);
+		if (a == "-no-color" || a == "--no-color") wei::diag::setColorEnabled(false);
+		if (a == "-color" || a == "--color") wei::diag::setColorEnabled(true);
+	}
 	{
 		std::vector<std::string> kws;
 		kws.reserve(kEngKws.size());
@@ -22781,12 +23122,16 @@ int main(int argc, char** argv) {
 	if (sub == "--list-codes" || sub == "codes" || sub == "-E") {
 		return wei::diag::listCodes();
 	}
+	if (sub == "pipeline" || sub == "--pipeline") {
+		return wei::diag::printPipeline();
+	}
 
 	if (argc < 3) {
 		wei::front::printError("错误: 子命令 '" + sub + "' 缺少文件参数");
 		return 2;
 	}
 	std::string file = argv[2];
+	wei::diag::setMainFile(file);
 
 	/* ── precompile: 把 .wei 库预编译成 .mod（二进制模块接口）──────────
 	   对应 C++20 的 "编译模块接口单元 → BMI"。
@@ -22877,6 +23222,8 @@ int main(int argc, char** argv) {
 			if (std::string(argv[i]) == "-g") debug_info = true;
 			if (std::string(argv[i]) == "-no-error-trace") error_trace = false;
 			if (std::string(argv[i]) == "-error-trace") error_trace = true;
+			if (std::string(argv[i]) == "--verbose" || std::string(argv[i]) == "-verbose")
+				wei::diag::setVerbose(true);
 			/* C3: -check=none|min|standard|full */
 			if (std::string(argv[i]).rfind("-check=", 0) == 0) {
 				std::string lv = std::string(argv[i]).substr(7);
@@ -22913,8 +23260,8 @@ int main(int argc, char** argv) {
 	wei::front::printError("错误: 未知子命令 '" + sub + "'");
 	std::cout << "用法: mtg build <文件> [-o 输出] [-std:wei27|中文|文言]"
 	          << " [-emit-norm:<文件>] [-target linux64|win64] [-no-opt] [-wide]"
-	          << " [-no-error-trace]\n";
-	std::cout << "      mtg explain <错误码> | mtg --list-codes | mtg --version\n";
+	          << " [-no-error-trace] [--verbose] [-no-color]\n";
+	std::cout << "      mtg explain <错误码> | mtg --list-codes | mtg --pipeline | mtg --version\n";
 	return 2;
 }
 
