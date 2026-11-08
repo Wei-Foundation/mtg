@@ -1,0 +1,44 @@
+name: Publish to npmjs.com
+
+# 把 @wei-foundation/mtg 发布到公共 npm 仓库。两条认证路径任选其一：
+#   1) Trusted Publishing（推荐，无需长期令牌）：在 npmjs.com 的包设置里
+#      添加 Trusted Publisher = Wei-Foundation/mtg + 本文件名 publish-npmjs.yml，
+#      之后 GitHub Actions 的 OIDC 会自动换取一次性发布令牌。
+#   2) 仓库 Settings -> Secrets -> Actions 添加 NPM_TOKEN
+#      （Granular Access Token，权限 Read and write，勾 Bypass 2FA）。
+# 两条都没有时发布会报 ENEEDAUTH，这是预期行为，不会误发。
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Verify package contents
+        run: npm pack --dry-run
+
+      - name: Publish via OIDC (Trusted Publishing)
+        if: env.HAS_NPM_TOKEN != 'true'
+        run: npm publish --access public --provenance
+
+      - name: Publish via NPM_TOKEN secret
+        if: env.HAS_NPM_TOKEN == 'true'
+        run: npm publish --access public --//registry.npmjs.org/:_authToken="$NPM_TOKEN"
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
