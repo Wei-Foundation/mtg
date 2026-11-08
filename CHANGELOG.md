@@ -2,6 +2,19 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 的格式，版本号沿用编译器 `--version` 输出的版本号。
 
+## [Unreleased]
+
+### Added
+
+- [`BEYOND-RUST.md`](BEYOND-RUST.md)：超越 Rust 的长期技术计划。明确「不比生态、
+  只比六个可度量维度」的边界，给出错误流图（EFG）、区域 + 线性能力令牌、
+  零工具链自举、诊断即修复四条不抄 Rust 的技术主线，以及 P0–P5 每期的
+  交付物、验收命令、退出条件与「明确不做」清单；所有性能数字一律标 `待测`，
+  未达标项必须公开留档，禁止下调指标
+- README 目录、简介与项目结构挂上该计划的入口
+
+---
+
 ## [0.9.5] - 2026-11-08
 
 ### Added
@@ -142,7 +155,7 @@
   stage0 无法重建 stage1。关键字表扩展后与 4004 行自举源码共有 57 个重合词，
   需要把保留字改为上下文敏感关键字，或系统性重命名自举源码里的标识符，
   属于独立的一期工作。`tests/bootstrap/run.ps1`（10/10）与
-  `tests/rustplus/run.ps1`（19/19）不受影响。
+  `tests/rustplus/run.ps1`（25/25）不受影响。
 - `tests/bootstrap/cli.ps1`（不带 `-RequireBuildSuccess`）目前 14/20：
   `build-done-text` 期望 `[done]` 而 CLI 输出 `[完成]`；`std-zh` /
   `std-wenyan` / `-target linux` / `-wide` 四条期望"被拒绝"，但三种方言、
